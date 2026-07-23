@@ -12,6 +12,7 @@ import torchvision.transforms.functional as F
 
 from hpsv2.src.open_clip import create_model, get_tokenizer
 from flowbp.eval.rewards.reward_ckpt_path import CKPT_PATH
+from flowbp.utils.hps_ckpt import ensure_hpsv2_ckpts
 
 OPENAI_DATASET_MEAN = (0.48145466, 0.4578275, 0.40821073)
 OPENAI_DATASET_STD = (0.26862954, 0.26130258, 0.27577711)
@@ -85,9 +86,12 @@ class HPSv2Scorer(nn.Module):
         super().__init__()
         self.dtype = dtype
         self.device = device
+        # Prefer FLOWBP_REWARD_CKPT_PATH / reward_ckpts; fall back to ./hps_ckpt (+ HF pull).
+        local_dir = CKPT_PATH if os.path.isdir(CKPT_PATH) else None
+        clip_path, hps_path = ensure_hpsv2_ckpts(local_dir)
         model = create_model(
             "ViT-H-14",
-            os.path.join(CKPT_PATH, "open_clip_pytorch_model.bin"),
+            clip_path,
             precision="amp",
             device=device,
             jit=False,
@@ -110,7 +114,7 @@ class HPSv2Scorer(nn.Module):
         )
         self.model = model.to(device)
         self.preprocess_val = preprocess_val
-        checkpoint = torch.load(os.path.join(CKPT_PATH, "HPS_v2.1_compressed.pt"), map_location="cpu")
+        checkpoint = torch.load(hps_path, map_location="cpu")
         self.model.load_state_dict(checkpoint["state_dict"])
         self.processor = get_tokenizer("ViT-H-14")
         self.eval()

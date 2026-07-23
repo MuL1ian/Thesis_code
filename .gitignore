@@ -143,6 +143,7 @@ TAGS
 # clangd background index
 .clangd/
 .cache/
+/.hf_cache/
 
 # bazel symlinks
 bazel-*

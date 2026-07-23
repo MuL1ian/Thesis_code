@@ -122,6 +122,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     # reward
     parser.add_argument("--use_hpsv2", action="store_true", default=False)
+    parser.add_argument(
+        "--reward_model_type",
+        choices=("hpsv2", "mps", "hpsv3plusplus"),
+        default="hpsv2",
+        help="Differentiable reward used for generator back-propagation.",
+    )
+    parser.add_argument(
+        "--reward_ckpt_path",
+        default="models/reward_ckpts",
+        help="Reward checkpoint file or root directory.",
+    )
+    parser.add_argument("--mps_processor_name", default=None)
+    parser.add_argument("--mps_condition", default=None)
+    parser.add_argument("--mps_mask_threshold", type=float, default=0.3)
     parser.add_argument("--use_ema", action="store_true")
     parser.add_argument("--project", type=str, default="flux2_rlhf")
     parser.add_argument("--run_name", type=str, default="flux2_leapalign")
@@ -143,6 +157,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--loss_grad_scale", type=float, default=1.0)
+    parser.add_argument(
+        "--reward_loss_type",
+        type=str,
+        default="hinge",
+        choices=["hinge", "relu_hinge", "neg_reward"],
+    )
+    parser.add_argument("--hpsv3plusplus_iter_start", type=float, default=0.3)
+    parser.add_argument("--hpsv3plusplus_iter_end", type=float, default=1.0)
     parser.add_argument("--loss_relu_clip", type=float, default=0.55)
     parser.add_argument("--alpha", type=float, default=0.3)
     parser.add_argument("--tau", type=float, default=0.1)

@@ -11,7 +11,11 @@ import torch
 import torch.distributed as dist
 import wandb
 
-from flowbp.eval.config import EvalConfig, configure_hpsv3_env
+from flowbp.eval.config import (
+    EvalConfig,
+    configure_hpsv3_env,
+    configure_hpsv3plusplus_env,
+)
 from flowbp.eval.generation.flux import GeneratedEvalItem, sample_flux_images_distributed
 from flowbp.eval.generation.sd35 import sample_sd35_images_distributed
 from flowbp.eval.logging_wandb import build_wandb_eval_log
@@ -46,6 +50,40 @@ def _score_local_items(
             if item_idx < len(reward_values):
                 score_item[reward_name] = reward_values[item_idx]
         local_scores.append(score_item)
+    return local_scores
+
+
+def _append_hpsv3plusplus_scores(
+    local_scores: list[dict[str, Any]],
+    local_items: list[GeneratedEvalItem],
+    hpsv3plusplus_scorer: Any,
+) -> list[dict[str, Any]]:
+    if not local_items:
+        return local_scores
+
+    if not local_scores:
+        local_scores = [
+            {
+                "prompt_idx": item.prompt_idx,
+                "img_idx": item.img_idx,
+                "prompt": item.prompt,
+            }
+            for item in local_items
+        ]
+
+    local_images = [item.image for item in local_items]
+    local_prompts = [item.prompt for item in local_items]
+    rewards = hpsv3plusplus_scorer.reward(local_images, local_prompts)
+    if not isinstance(rewards, torch.Tensor):
+        rewards = torch.as_tensor(rewards)
+    rewards = rewards.detach().float()
+    if rewards.ndim == 2 and rewards.shape[1] >= 1:
+        rewards = rewards[:, 0]
+    elif rewards.ndim > 1:
+        rewards = rewards.reshape(rewards.shape[0], -1)[:, 0]
+    values = as_float_list(rewards)
+    for score_item, value in zip(local_scores, values):
+        score_item["hpsv3plusplus"] = float(value)
     return local_scores
 
 
@@ -152,6 +190,7 @@ def run_online_sd35_eval(
     rank: int,
     world_size: int,
     device: int | str | torch.device,
+    hpsv3plusplus_scorer: Any | None = None,
 ) -> None:
     """Run distributed SD3.5 eval and score outputs through eval reward fns."""
 
@@ -161,6 +200,9 @@ def run_online_sd35_eval(
     hpsv3_paths = configure_hpsv3_env(eval_cfg)
     if hpsv3_paths:
         main_print(f"--> HPSv3 paths: {hpsv3_paths}")
+    hpsv3plusplus_paths = configure_hpsv3plusplus_env(eval_cfg)
+    if hpsv3plusplus_paths:
+        main_print(f"--> HPSv3++ paths: {hpsv3plusplus_paths}")
 
     local_items = sample_sd35_images_distributed(
         eval_cfg=eval_cfg,
@@ -171,17 +213,40 @@ def run_online_sd35_eval(
         device=device,
     )
 
+    requested_rewards = {
+        str(name).lower(): float(weight)
+        for name, weight in eval_cfg.reward_fn.items()
+    }
+    reuse_hpsv3plusplus = (
+        "hpsv3plusplus" in requested_rewards and hpsv3plusplus_scorer is not None
+    )
+    scorer_reward_fn = dict(requested_rewards)
+    if reuse_hpsv3plusplus:
+        scorer_reward_fn.pop("hpsv3plusplus", None)
+
     scorer, active_rewards = build_reward_scorer(
-        reward_fn=eval_cfg.reward_fn,
+        reward_fn=scorer_reward_fn,
         device=device,
         reward_ckpt_path=eval_cfg.reward_ckpt_path,
         allow_unavailable=True,
     )
+    unavailable_rewards = getattr(scorer, "unavailable_rewards", {})
+    if unavailable_rewards:
+        main_print(f"--> SD3.5 eval unavailable rewards: {unavailable_rewards}")
     try:
         local_scores = _score_local_items(scorer, local_items)
     finally:
         scorer.to(torch.device("cpu"))
         del scorer
+    if reuse_hpsv3plusplus:
+        main_print("--> SD3.5 eval reusing training HPSv3++ reward model")
+        local_scores = _append_hpsv3plusplus_scores(
+            local_scores,
+            local_items,
+            hpsv3plusplus_scorer,
+        )
+        if "hpsv3plusplus" not in active_rewards:
+            active_rewards = list(active_rewards) + ["hpsv3plusplus"]
 
     all_scores_gathered = [None] * world_size
     dist.all_gather_object(all_scores_gathered, local_scores)

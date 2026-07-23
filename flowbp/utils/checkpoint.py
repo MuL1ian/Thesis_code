@@ -14,6 +14,30 @@ from torch.distributed.fsdp import StateDictType
 from flowbp.utils.logging_ import main_print
 
 
+def _unwrap_model_config(model):
+    for attr in ("module",):
+        model = getattr(model, attr, model)
+
+    config = getattr(model, "config", None)
+    if config is not None:
+        return config
+
+    base_model = getattr(model, "base_model", None)
+    if base_model is not None:
+        inner_model = getattr(base_model, "model", base_model)
+        config = getattr(inner_model, "config", None)
+        if config is not None:
+            return config
+
+    raise AttributeError(f"Could not find a diffusers config on {type(model)}")
+
+
+def _config_to_dict(model):
+    config_dict = dict(_unwrap_model_config(model))
+    config_dict.pop("dtype", None)
+    return config_dict
+
+
 def save_checkpoint_optimizer(model,
                               optimizer,
                               rank,
@@ -38,8 +62,7 @@ def save_checkpoint_optimizer(model,
         weight_path = os.path.join(save_dir,
                                    "diffusion_pytorch_model.safetensors")
         save_file(cpu_state, weight_path)
-        config_dict = dict(model.config)
-        config_dict.pop('dtype')
+        config_dict = _config_to_dict(model)
         config_path = os.path.join(save_dir, "config.json")
         with open(config_path, "w") as f:
             json.dump(config_dict, f, indent=4)
@@ -68,9 +91,7 @@ def save_checkpoint(transformer, rank, output_dir, step, epoch, mean_grad_norm=N
         weight_path = os.path.join(save_dir,
                                    "diffusion_pytorch_model.safetensors")
         save_file(cpu_state, weight_path)
-        config_dict = dict(transformer.config)
-        if "dtype" in config_dict:
-            del config_dict["dtype"]
+        config_dict = _config_to_dict(transformer)
         config_path = os.path.join(save_dir, "config.json")
         with open(config_path, "w") as f:
             json.dump(config_dict, f, indent=4)
@@ -79,6 +100,43 @@ def save_checkpoint(transformer, rank, output_dir, step, epoch, mean_grad_norm=N
             with open(os.path.join(save_dir, 'mean_grad_norm.json'), 'w') as f:
                 json.dump({'mean_grad_norm': mean_grad_norm}, f, indent=4)
     main_print(f"--> checkpoint saved at step {step}")
+
+
+def save_peft_checkpoint(
+    transformer, rank, output_dir, step, epoch, adapter_type="peft"
+):
+    """Save a standard PEFT adapter from an FSDP-wrapped diffusion model."""
+    adapter_type = str(adapter_type).lower()
+    main_print(f"--> saving {adapter_type.upper()} checkpoint at step {step}")
+    peft_model = getattr(transformer, "module", None)
+    if peft_model is None or not hasattr(peft_model, "peft_config"):
+        raise TypeError("Expected an FSDP-wrapped PEFT model for checkpointing.")
+
+    with FSDP.state_dict_type(
+            transformer,
+            StateDictType.FULL_STATE_DICT,
+            FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
+    ):
+        full_state_dict = transformer.state_dict()
+
+    if rank <= 0:
+        save_dir = os.path.join(
+            output_dir, f"{adapter_type}-checkpoint-{step}-{epoch}"
+        )
+        os.makedirs(save_dir, exist_ok=True)
+        peft_model.save_pretrained(
+            save_dir,
+            state_dict=full_state_dict,
+            safe_serialization=True,
+            is_main_process=True,
+        )
+        with open(os.path.join(save_dir, "training_state.json"), "w") as f:
+            json.dump(
+                {"step": step, "epoch": epoch, "adapter_type": adapter_type},
+                f,
+                indent=4,
+            )
+    main_print(f"--> {adapter_type.upper()} checkpoint saved at step {step}")
 
 
 def save_checkpoint_generator_discriminator(
@@ -102,7 +160,7 @@ def save_checkpoint_generator_discriminator(
     hf_weight_dir = os.path.join(save_dir, "hf_weights")
     os.makedirs(hf_weight_dir, exist_ok=True)
     if rank <= 0:
-        config_dict = dict(model.config)
+        config_dict = _config_to_dict(model)
         config_path = os.path.join(hf_weight_dir, "config.json")
         # save dict as json
         with open(config_path, "w") as f:

@@ -73,6 +73,43 @@ _SECTION_KEY_MAP: dict[str, dict[str, str]] = {
         "lr_power": "lr_power",
         "max_grad_norm": "max_grad_norm",
     },
+    "lora": {
+        "enabled": "use_lora",
+        "use_lora": "use_lora",
+        "target_modules": "lora_target_modules",
+        "rank": "lora_rank",
+        "alpha": "lora_alpha",
+        "dropout": "lora_dropout",
+    },
+    "gradlora": {
+        "enabled": "use_gradlora",
+        "use_gradlora": "use_gradlora",
+        "target_modules": "gradlora_target_modules",
+        "rank": "gradlora_rank",
+        "alpha": "gradlora_alpha",
+        "dropout": "gradlora_dropout",
+        "calibration_batches": "gradlora_calibration_batches",
+        "calibration_mode": "gradlora_calibration_mode",
+        "fullbp_batch_size": "gradlora_fullbp_batch_size",
+        "fullbp_full_cfg_grad": "gradlora_fullbp_full_cfg_grad",
+        "use_second_moment": "gradlora_use_second_moment",
+        "second_moment_beta": "gradlora_second_moment_beta",
+        "accumulation_device": "gradlora_accumulation_device",
+        "svd_device": "gradlora_svd_device",
+        "svd_oversample": "gradlora_svd_oversample",
+        "svd_niter": "gradlora_svd_niter",
+        "diagnostics_path": "gradlora_diagnostics_path",
+    },
+    "oft": {
+        "enabled": "use_oft",
+        "use_oft": "use_oft",
+        "target_modules": "oft_target_modules",
+        "block_size": "oft_block_size",
+        "module_dropout": "oft_module_dropout",
+        "coft": "oft_coft",
+        "eps": "oft_eps",
+        "block_share": "oft_block_share",
+    },
     "distributed": {
         "sp_size": "sp_size",
         "fsdp_sharding_startegy": "fsdp_sharding_startegy",
@@ -89,8 +126,19 @@ _SECTION_KEY_MAP: dict[str, dict[str, str]] = {
     },
     "reward": {
         "use_hpsv2": "use_hpsv2",
+        "model_type": "reward_model_type",
+        "reward_model_type": "reward_model_type",
+        "ckpt_path": "reward_ckpt_path",
+        "reward_ckpt_path": "reward_ckpt_path",
+        "mps_processor_name": "mps_processor_name",
+        "mps_condition": "mps_condition",
+        "mps_mask_threshold": "mps_mask_threshold",
+        "loss_type": "reward_loss_type",
+        "reward_loss_type": "reward_loss_type",
         "loss_grad_scale": "loss_grad_scale",
         "loss_relu_clip": "loss_relu_clip",
+        "hpsv3plusplus_iter_start": "hpsv3plusplus_iter_start",
+        "hpsv3plusplus_iter_end": "hpsv3plusplus_iter_end",
     },
     "flowbp": {
         "select_idx_seed": "select_idx_seed",
@@ -162,6 +210,7 @@ _SECTION_KEY_MAP: dict[str, dict[str, str]] = {
     "logging": {
         "project": "project",
         "run_name": "run_name",
+        "tags": "wandb_tags",
     },
     "flux2": {
         "max_sequence_length": "max_sequence_length",
@@ -252,6 +301,9 @@ def infer_model_name(config_path: str | Path | None, config_data: dict[str, Any]
 
 def infer_reward_name(config_data: dict[str, Any] | None = None) -> str:
     reward = (config_data or {}).get("reward") or {}
+    reward_model = reward.get("model_type") or reward.get("reward_model_type")
+    if reward_model:
+        return _sanitize_name(reward_model)
     if reward.get("use_hpsv2", False):
         return "hpsv2"
     eval_reward = ((config_data or {}).get("eval") or {}).get("reward_fn")

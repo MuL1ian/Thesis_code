@@ -10,7 +10,7 @@ For FlowBP evaluation, we use a simplified interface:
     # score_details = {"pickscore": [...], "hpsv2": [...], "mean": [...]}
 
 Supported reward keys include:
-pickscore, hpsv2, hpsv3, clipscore, imagereward, geneval,
+pickscore, hpsv2, mps, hpsv3, hpsv3plusplus, clipscore, imagereward, geneval,
 unifiedreward, ur-align, ur-iq.
 """
 
@@ -129,6 +129,17 @@ def hpsv2_score(device):
     return _fn
 
 
+def mps_score(device):
+    from flowbp.eval.rewards.mps_scorer import MPSScorer
+    scorer = MPSScorer(dtype=torch.float32, device=device)
+    def _fn(images, prompts, metadata):
+        del metadata
+        images = _pil_list_to_nchw_tensor(images).float() / 255.0
+        scores = scorer(images, prompts)
+        return scores, {}
+    return _fn
+
+
 def hpsv3_score(device):
     from flowbp.eval.rewards.hpsv3_scorer import HPSv3Scorer
     scorer = HPSv3Scorer(dtype=torch.float32, device=device)
@@ -136,6 +147,18 @@ def hpsv3_score(device):
         del metadata
         images = _pil_list_to_pil(images)
         scores = scorer(images, prompts)
+        return scores, {}
+    return _fn
+
+
+def hpsv3plusplus_score(device):
+    from flowbp.eval.rewards.hpsv3plusplus_scorer import HPSv3PlusPlusScorer
+    scorer = HPSv3PlusPlusScorer(dtype=torch.float32, device=device)
+    def _fn(images, prompts, metadata):
+        iter_step = None
+        if isinstance(metadata, dict):
+            iter_step = metadata.get("iter_step")
+        scores = scorer(images, prompts, iter_step=iter_step)
         return scores, {}
     return _fn
 
@@ -348,7 +371,9 @@ class MultiScorer:
             "ur-iq": unifiedreward_iq_score,
             "clipscore": clip_score,
             "hpsv2": hpsv2_score,
+            "mps": mps_score,
             "hpsv3": hpsv3_score,
+            "hpsv3plusplus": hpsv3plusplus_score,
         }
         self.requested_score_dict = dict(score_dict)
         self.score_dict = {}

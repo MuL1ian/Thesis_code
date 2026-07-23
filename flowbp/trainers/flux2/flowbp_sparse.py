@@ -34,6 +34,10 @@ import torch.distributed as dist
 import torch.nn.functional as F
 import wandb
 
+from flowbp.rewards.differentiable import (
+    compute_differentiable_reward,
+    reward_loss_values,
+)
 from flowbp.trainers.common.rollout_window import resolve_train_step_window
 from flowbp.trainers.flux1.flowbp_sparse import (
     _compose_x0_from_velocities,
@@ -252,27 +256,19 @@ def get_flowbp_sparse_reward_loss(
     caption,
     preprocess_val,
 ):
-    """FLUX.2 reward loss: packed -> unpack -> de-BN -> unpatchify -> VAE -> HPSv2."""
+    """FLUX.2 reward loss through the selected differentiable reward model."""
     image_pred_x0 = decode_packed_latents(args, vae, latents_pred_x0)
 
-    if args.use_hpsv2:
-        image_pred_x0 = preprocess_val(image_pred_x0)
-        text = tokenizer(caption).to(
-            device=image_pred_x0.device, non_blocking=True,
-        )
-        with torch.amp.autocast("cuda"):
-            outputs = reward_model(image_pred_x0, text)
-            image_features = outputs["image_features"]
-            text_features = outputs["text_features"]
-            reward_pred_x0 = torch.einsum(
-                "bc,bc->b", image_features, text_features,
-            )
-    else:
-        raise NotImplementedError(
-            "Only HPSv2 is currently supported for FlowBP-Sparse FLUX.2."
-        )
+    reward_pred_x0 = compute_differentiable_reward(
+        args,
+        image_pred_x0,
+        caption,
+        reward_model,
+        tokenizer,
+        preprocess_val,
+    )
 
-    raw_loss = F.relu(-reward_pred_x0 + args.loss_relu_clip) * args.loss_grad_scale
+    raw_loss = reward_loss_values(args, reward_pred_x0)
     loss = torch.mean(
         sample_weights.to(raw_loss.device, raw_loss.dtype) * raw_loss
     )

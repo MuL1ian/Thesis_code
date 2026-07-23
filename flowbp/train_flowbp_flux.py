@@ -197,6 +197,135 @@ def build_parser() -> argparse.ArgumentParser:
         "--weight_decay", type=float, default=0.01, help="Weight decay to apply."
     )
     parser.add_argument(
+        "--use_lora",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Wrap the transformer with a PEFT LoRA adapter before FSDP.",
+    )
+    parser.add_argument(
+        "--lora_target_modules",
+        type=str,
+        default="default",
+        help="Comma-separated LoRA target module suffixes, or preset 'default'/'attention'.",
+    )
+    parser.add_argument("--lora_rank", type=int, default=32)
+    parser.add_argument("--lora_alpha", type=float, default=64.0)
+    parser.add_argument("--lora_dropout", type=float, default=0.05)
+    parser.add_argument(
+        "--use_gradlora",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use reward-gradient-aligned LoRA initialization. Version 1 is "
+            "integrated in the SD3.5 trainer."
+        ),
+    )
+    parser.add_argument(
+        "--gradlora_target_modules",
+        type=str,
+        default="default",
+        help="Comma-separated GradLoRA target module suffixes, or preset 'default'/'attention'.",
+    )
+    parser.add_argument("--gradlora_rank", type=int, default=32)
+    parser.add_argument("--gradlora_alpha", type=float, default=64.0)
+    parser.add_argument("--gradlora_dropout", type=float, default=0.05)
+    parser.add_argument(
+        "--gradlora_calibration_batches",
+        type=int,
+        default=4,
+        help="Reward-backprop batches used to estimate each virtual dense gradient.",
+    )
+    parser.add_argument(
+        "--gradlora_calibration_mode",
+        type=str,
+        default="sparse",
+        choices=("sparse", "fullbp"),
+        help=(
+            "Gradient source for GradLoRA calibration: 'sparse' follows the "
+            "configured training sampler; 'fullbp' backpropagates through the "
+            "complete flow trajectory."
+        ),
+    )
+    parser.add_argument(
+        "--gradlora_fullbp_batch_size",
+        type=int,
+        default=1,
+        help="Per-rank microbatch size used only for FullBP calibration.",
+    )
+    parser.add_argument(
+        "--gradlora_fullbp_full_cfg_grad",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Backpropagate through both CFG branches during FullBP calibration. "
+            "By default FullBP follows cfg_detach_neg from the training config."
+        ),
+    )
+    parser.add_argument(
+        "--gradlora_use_second_moment",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Initialize GradLoRA from a shrinkage mixture of the mean-gradient "
+            "subspace and per-calibration-batch gradient energy."
+        ),
+    )
+    parser.add_argument(
+        "--gradlora_second_moment_beta",
+        type=float,
+        default=0.5,
+        help=(
+            "Second-moment mixture weight in (0, 1]. Used only when "
+            "--gradlora_use_second_moment is enabled."
+        ),
+    )
+    parser.add_argument(
+        "--gradlora_accumulation_device",
+        type=str,
+        default="cpu",
+        choices=("cpu", "cuda"),
+        help="Where virtual dense calibration gradients are accumulated.",
+    )
+    parser.add_argument(
+        "--gradlora_svd_device",
+        type=str,
+        default="cuda",
+        choices=("cpu", "cuda"),
+        help="Device used for the one-time randomized SVD.",
+    )
+    parser.add_argument("--gradlora_svd_oversample", type=int, default=8)
+    parser.add_argument("--gradlora_svd_niter", type=int, default=4)
+    parser.add_argument(
+        "--gradlora_diagnostics_path",
+        type=str,
+        default=None,
+        help=(
+            "Optional JSON path for calibration spectra. Defaults to "
+            "<output_dir>/gradlora_calibration.json."
+        ),
+    )
+    parser.add_argument(
+        "--use_oft",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Wrap the transformer with a PEFT OFT adapter before FSDP.",
+    )
+    parser.add_argument(
+        "--oft_target_modules",
+        type=str,
+        default="default",
+        help="Comma-separated OFT target module suffixes, or preset 'default'/'attention'.",
+    )
+    parser.add_argument("--oft_block_size", type=int, default=32)
+    parser.add_argument("--oft_module_dropout", type=float, default=0.0)
+    parser.add_argument(
+        "--oft_coft", action=argparse.BooleanOptionalAction, default=False
+    )
+    parser.add_argument("--oft_eps", type=float, default=6e-5)
+    parser.add_argument(
+        "--oft_block_share", action=argparse.BooleanOptionalAction, default=False
+    )
+    parser.add_argument(
         "--master_weight_type",
         type=str,
         default="fp32",
@@ -238,8 +367,29 @@ def build_parser() -> argparse.ArgumentParser:
         "--use_hpsv2",
         action="store_true",
         default=False,
-        help="whether use hpsv2 as reward model",
+        help="Deprecated compatibility flag; prefer --reward_model_type hpsv2.",
     )
+    parser.add_argument(
+        "--reward_model_type",
+        type=str,
+        choices=("hpsv2", "mps", "hpsv3plusplus"),
+        default="hpsv2",
+        help="Differentiable reward used for generator back-propagation.",
+    )
+    parser.add_argument(
+        "--reward_ckpt_path",
+        type=str,
+        default="models/reward_ckpts",
+        help="Reward checkpoint file or root directory.",
+    )
+    parser.add_argument(
+        "--mps_processor_name",
+        type=str,
+        default=None,
+        help="Optional local path or Hugging Face id for the MPS CLIP processor.",
+    )
+    parser.add_argument("--mps_condition", type=str, default=None)
+    parser.add_argument("--mps_mask_threshold", type=float, default=0.3)
     parser.add_argument(
         "--use_ema", 
         action="store_true", 
@@ -256,6 +406,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default="flux_grpo",
         help="run name for wandb",
+    )
+    parser.add_argument(
+        "--wandb_tags",
+        type=str,
+        nargs="*",
+        default=None,
+        help="Optional wandb tags, e.g. --wandb_tags mps lora.",
     )
     parser.add_argument(
         "--cfg_guidance",
@@ -298,6 +455,28 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=1.0,
         help="reward loss coefficient",
+    )
+    parser.add_argument(
+        "--reward_loss_type",
+        type=str,
+        default="hinge",
+        choices=["hinge", "relu_hinge", "neg_reward"],
+        help=(
+            "Reward optimization loss. 'hinge' keeps relu(-reward + "
+            "loss_relu_clip); 'neg_reward' directly maximizes via -reward."
+        ),
+    )
+    parser.add_argument(
+        "--hpsv3plusplus_iter_start",
+        type=float,
+        default=0.3,
+        help="Initial normalized HPSv3++ RL-iteration condition.",
+    )
+    parser.add_argument(
+        "--hpsv3plusplus_iter_end",
+        type=float,
+        default=1.0,
+        help="Final normalized HPSv3++ RL-iteration condition.",
     )
     parser.add_argument(
         "--loss_relu_clip",

@@ -108,3 +108,36 @@ def configure_hpsv3_env(eval_cfg: EvalConfig) -> dict[str, str]:
             "FLOWBP_HPSV3_CHECKPOINT_PATH"
         ]
     return resolved
+
+
+def configure_hpsv3plusplus_env(eval_cfg: EvalConfig) -> dict[str, str]:
+    """Populate FLOWBP_HPSV3PLUSPLUS_* env vars for HPSv3++ scorers."""
+
+    if "hpsv3plusplus" not in {str(k).lower() for k in eval_cfg.reward_fn}:
+        return {}
+
+    config_path = _first_existing(
+        os.environ.get("FLOWBP_HPSV3PLUSPLUS_CONFIG_PATH"),
+        eval_cfg.hpsv3_config_path,
+        osp.join(eval_cfg.reward_ckpt_path or "", "HPSv3-PlusPlus", "config.json"),
+        osp.join(eval_cfg.reward_ckpt_path or "", "hpsv3plusplus", "config.json"),
+    )
+    checkpoint_path = _first_existing(
+        os.environ.get("FLOWBP_HPSV3PLUSPLUS_CHECKPOINT_PATH"),
+        eval_cfg.hpsv3_checkpoint_path,
+        osp.join(eval_cfg.reward_ckpt_path or "", "HPSv3-PlusPlus", "hpsv3++.pth"),
+        osp.join(eval_cfg.reward_ckpt_path or "", "hpsv3plusplus", "hpsv3++.pth"),
+    )
+
+    resolved: dict[str, str] = {}
+    if config_path:
+        os.environ.setdefault("FLOWBP_HPSV3PLUSPLUS_CONFIG_PATH", config_path)
+        resolved["FLOWBP_HPSV3PLUSPLUS_CONFIG_PATH"] = os.environ[
+            "FLOWBP_HPSV3PLUSPLUS_CONFIG_PATH"
+        ]
+    if checkpoint_path:
+        os.environ.setdefault("FLOWBP_HPSV3PLUSPLUS_CHECKPOINT_PATH", checkpoint_path)
+        resolved["FLOWBP_HPSV3PLUSPLUS_CHECKPOINT_PATH"] = os.environ[
+            "FLOWBP_HPSV3PLUSPLUS_CHECKPOINT_PATH"
+        ]
+    return resolved

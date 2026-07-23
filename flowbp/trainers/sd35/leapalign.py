@@ -28,6 +28,13 @@ from flowbp.dataset.latent_sd35_rl_datasets import (
     latent_sd35_collate_function,
 )
 from flowbp.eval.runners.online import run_online_sd35_eval
+from flowbp.rewards.differentiable import (
+    compute_differentiable_reward,
+    init_hpsv3plusplus_reward,
+    init_mps_reward,
+    reward_loss_values,
+    reward_model_type,
+)
 from flowbp.schedulers.fm_euler_discrete_with_pred_x0 import (
     FlowMatchEulerDiscreteWithPredX0Scheduler,
 )
@@ -36,12 +43,20 @@ from flowbp.trainers.common.flowbp_lagrange_utils import (
     save_jk_sampling_csv,
 )
 from flowbp.trainers.common.jk_sampling import sample_jk_indices
-from flowbp.utils.checkpoint import save_checkpoint
+from flowbp.utils.checkpoint import save_checkpoint, save_peft_checkpoint
 from flowbp.utils.debug_utils import setup_debug
 from flowbp.utils.ema_utils import save_sharded_ema_checkpoint
 from flowbp.utils.fsdp_util import apply_fsdp_checkpointing, get_dit_fsdp_kwargs
+from flowbp.utils.gradlora_adapter import (
+    GradLoRACalibrator,
+    apply_gradlora_if_enabled,
+)
 from flowbp.utils.hpsv2_transforms import HPSV2TransformsWithGrad
 from flowbp.utils.logging_ import main_print
+from flowbp.utils.peft_adapter import (
+    apply_lora_if_enabled,
+    apply_oft_if_enabled,
+)
 from flowbp.utils.parallel_states import (
     destroy_sequence_parallel_group,
     get_sequence_parallel_state,
@@ -151,6 +166,7 @@ def _model_forward_sd35(
     pooled_prompt_embeds,
     negative_prompt_embeds,
     negative_pooled_prompt_embeds,
+    detach_negative_branch_override=None,
 ):
     """SD3.5 transformer forward with classifier-free guidance.
 
@@ -182,7 +198,11 @@ def _model_forward_sd35(
     if not _should_apply_cfg(args, negative_prompt_embeds, negative_pooled_prompt_embeds):
         return pred_cond
 
-    detach_negative_branch = bool(getattr(args, "cfg_detach_neg", True))
+    detach_negative_branch = (
+        bool(detach_negative_branch_override)
+        if detach_negative_branch_override is not None
+        else bool(getattr(args, "cfg_detach_neg", True))
+    )
     neg_latents = latents.detach() if detach_negative_branch else latents
 
     if detach_negative_branch:
@@ -446,6 +466,12 @@ def _repeat_captions(caption, repeats: int):
     return list(caption) * repeats
 
 
+def _slice_captions(caption, batch_size: int):
+    if isinstance(caption, str):
+        return caption
+    return list(caption)[:batch_size]
+
+
 def get_reward_loss_sd35(
     args,
     latents_pred_x0,
@@ -458,19 +484,15 @@ def get_reward_loss_sd35(
     preprocess_val,
 ):
     image_pred_x0 = _decode_sd35_latents(args, vae, latents_pred_x0)
-    if args.use_hpsv2:
-        image_pred_x0 = preprocess_val(image_pred_x0)
-        text = tokenizer(caption).to(device=image_pred_x0.device, non_blocking=True)
-        with torch.amp.autocast("cuda"):
-            outputs = reward_model(image_pred_x0, text)
-            reward_pred_x0 = torch.einsum(
-                "bc,bc->b",
-                outputs["image_features"],
-                outputs["text_features"],
-            )
-    else:
-        raise NotImplementedError("Only HPSv2 is currently supported for reward computation.")
-    raw_loss = F.relu(-reward_pred_x0 + args.loss_relu_clip) * args.loss_grad_scale
+    reward_pred_x0 = compute_differentiable_reward(
+        args,
+        image_pred_x0,
+        caption,
+        reward_model,
+        tokenizer,
+        preprocess_val,
+    )
+    raw_loss = reward_loss_values(args, reward_pred_x0)
     if sample_weights is not None:
         sample_weights = sample_weights.to(raw_loss.device, raw_loss.dtype)
         raw_loss = sample_weights * raw_loss
@@ -511,6 +533,9 @@ def train_sd35_one_step(
     loader,
     preprocess_val,
     select_idx_generator,
+    perform_optimizer_step=True,
+    trainer_override=None,
+    batch_size_override=None,
 ):
     (
         prompt_embeds,
@@ -519,7 +544,25 @@ def train_sd35_one_step(
         negative_pooled_prompt_embeds,
         caption,
     ) = next(loader)
+    if batch_size_override is not None:
+        effective_batch_size = int(batch_size_override)
+        if effective_batch_size < 1:
+            raise ValueError(
+                f"batch_size_override must be at least 1, got {effective_batch_size}"
+            )
+        available_batch_size = int(prompt_embeds.shape[0])
+        effective_batch_size = min(effective_batch_size, available_batch_size)
+        prompt_embeds = prompt_embeds[:effective_batch_size]
+        pooled_prompt_embeds = pooled_prompt_embeds[:effective_batch_size]
+        if negative_prompt_embeds is not None:
+            negative_prompt_embeds = negative_prompt_embeds[:effective_batch_size]
+        if negative_pooled_prompt_embeds is not None:
+            negative_pooled_prompt_embeds = negative_pooled_prompt_embeds[
+                :effective_batch_size
+            ]
+        caption = _slice_captions(caption, effective_batch_size)
     caption_for_reward = caption
+    effective_trainer = trainer_override or args.trainer
     # Function-local imports keep the per-algorithm trainer modules decoupled
     # from this module at import time (they import shared backend helpers from
     # here), avoiding circular imports while still dispatching by trainer name.
@@ -527,10 +570,25 @@ def train_sd35_one_step(
     from flowbp.trainers.sd35.flowbp_sparse import sample_flowbp_sparse_trajectory_sd35
     from flowbp.trainers.sd35.draft_lv import sample_draft_lv_trajectory_sd35
     from flowbp.trainers.sd35.drtune import sample_drtune_trajectory_sd35
+    from flowbp.trainers.sd35.fullbp import sample_fullbp_trajectory_sd35
     from flowbp.trainers.sd35.flowbp_lagrange import sample_flowbp_lagrange_trajectory_sd35
     from flowbp.trainers.sd35.refl import sample_refl_trajectory_sd35
 
-    if args.trainer == "flowbp_lagrange":
+    if effective_trainer == "fullbp":
+        latents_pred_x0, sample_weights, traj_metrics = (
+            sample_fullbp_trajectory_sd35(
+                args,
+                device,
+                transformer,
+                fm_scheduler,
+                prompt_embeds,
+                pooled_prompt_embeds,
+                negative_prompt_embeds,
+                negative_pooled_prompt_embeds,
+                select_idx_generator,
+            )
+        )
+    elif effective_trainer == "flowbp_lagrange":
         latents_pred_x0, sample_weights, traj_metrics = sample_flowbp_lagrange_trajectory_sd35(
             args,
             device,
@@ -543,7 +601,7 @@ def train_sd35_one_step(
             select_idx_generator,
         )
         _maybe_log_connector_wandb(args, vae, "sd35_flowbp_lagrange", getattr(args, "_last_connector_payload", None))
-    elif args.trainer == "draft_lv":
+    elif effective_trainer == "draft_lv":
         _, latents_pred_x0, sample_weights, traj_metrics = sample_draft_lv_trajectory_sd35(
             args,
             device,
@@ -557,7 +615,7 @@ def train_sd35_one_step(
         )
         repeat_factor = latents_pred_x0.shape[0] // prompt_embeds.shape[0]
         caption_for_reward = _repeat_captions(caption, repeat_factor)
-    elif args.trainer == "drtune":
+    elif effective_trainer == "drtune":
         _, latents_pred_x0, sample_weights, traj_metrics = sample_drtune_trajectory_sd35(
             args,
             device,
@@ -569,7 +627,7 @@ def train_sd35_one_step(
             negative_pooled_prompt_embeds,
             select_idx_generator,
         )
-    elif args.trainer == "refl":
+    elif effective_trainer == "refl":
         _, latents_pred_x0, sample_weights, traj_metrics = sample_refl_trajectory_sd35(
             args,
             device,
@@ -581,7 +639,7 @@ def train_sd35_one_step(
             negative_pooled_prompt_embeds,
             select_idx_generator,
         )
-    elif args.trainer == "flowbp_sparse":
+    elif effective_trainer == "flowbp_sparse":
         latents_pred_x0, sample_weights, traj_metrics = sample_flowbp_sparse_trajectory_sd35(
             args,
             device,
@@ -594,7 +652,7 @@ def train_sd35_one_step(
             select_idx_generator,
         )
         _maybe_log_connector_wandb(args, vae, "sd35_flowbp_sparse", getattr(args, "_last_connector_payload", None))
-    elif args.trainer == "flowbp_bridge":
+    elif effective_trainer == "flowbp_bridge":
         latents_pred_x0, sample_weights, traj_metrics = sample_flowbp_bridge_trajectory_sd35(
             args,
             device,
@@ -621,7 +679,7 @@ def train_sd35_one_step(
         )
         _maybe_log_connector_wandb(args, vae, "sd35_leapalign", getattr(args, "_last_connector_payload", None))
 
-    if args.trainer == "flowbp_lagrange":
+    if effective_trainer == "flowbp_lagrange":
         payload = getattr(args, "_last_connector_payload", None)
         current_step = getattr(args, "current_train_step", None)
         if payload is not None and current_step is not None and dist.get_rank() == 0:
@@ -673,7 +731,10 @@ def train_sd35_one_step(
         dist.all_reduce(metric_tensor.div_(args.gradient_accumulation_steps), op=dist.ReduceOp.AVG)
         reduced_traj_metrics[metric_name] = metric_tensor.item()
 
-    if (inner_step + 1) % args.gradient_accumulation_steps == 0:
+    if (
+        perform_optimizer_step
+        and (inner_step + 1) % args.gradient_accumulation_steps == 0
+    ):
         grad_norm = transformer.clip_grad_norm_(args.max_grad_norm)
         _align_grad_dtype_to_param_dtype(transformer)
         optimizer.step()
@@ -687,10 +748,12 @@ def train_sd35_one_step(
 
 def _init_hpsv2(args, device):
     from hpsv2.src.open_clip import create_model_and_transforms, get_tokenizer
+    from flowbp.utils.hps_ckpt import ensure_hpsv2_ckpts
 
+    clip_path, hps_path = ensure_hpsv2_ckpts()
     model, _, preprocess_val = create_model_and_transforms(
         "ViT-H-14",
-        "./hps_ckpt/open_clip_pytorch_model.bin",
+        clip_path,
         precision="amp",
         device=device,
         jit=False,
@@ -708,7 +771,7 @@ def _init_hpsv2(args, device):
         with_region_predictor=False,
     )
     preprocess_val = HPSV2TransformsWithGrad(preprocess_val)
-    checkpoint = torch.load("./hps_ckpt/HPS_v2.1_compressed.pt", map_location=f"cuda:{device}")
+    checkpoint = torch.load(hps_path, map_location=f"cuda:{device}")
     model.load_state_dict(checkpoint["state_dict"])
     processor = get_tokenizer("ViT-H-14")
     reward_model = model.to(device)
@@ -775,9 +838,16 @@ def run_training_sd35(args):
     if rank <= 0 and args.output_dir is not None:
         os.makedirs(args.output_dir, exist_ok=True)
 
-    if not args.use_hpsv2:
-        raise NotImplementedError("Only HPSv2 is currently supported as the reward model.")
-    reward_model, processor, preprocess_val = _init_hpsv2(args, device)
+    selected_reward = reward_model_type(args)
+    if selected_reward == "mps":
+        reward_model, processor, preprocess_val = init_mps_reward(args, device)
+    elif selected_reward == "hpsv3plusplus":
+        reward_model, processor, preprocess_val = init_hpsv3plusplus_reward(
+            args, device
+        )
+    else:
+        reward_model, processor, preprocess_val = _init_hpsv2(args, device)
+    main_print(f"--> differentiable reward: {selected_reward}")
 
     main_print(f"--> loading SD3 model from {args.pretrained_model_name_or_path}")
     transformer = SD3Transformer2DModel.from_pretrained(
@@ -789,11 +859,39 @@ def run_training_sd35(args):
         args.pretrained_model_name_or_path,
         subfolder="scheduler",
     )
+    enabled_adapters = [
+        name
+        for name, enabled in (
+            ("lora", args.use_lora),
+            ("gradlora", args.use_gradlora),
+            ("oft", args.use_oft),
+        )
+        if enabled
+    ]
+    if len(enabled_adapters) > 1:
+        raise ValueError(
+            "LoRA, GradLoRA, and OFT are mutually exclusive; "
+            "enable only one. "
+            f"Enabled: {enabled_adapters}"
+        )
+    transformer, use_lora = apply_lora_if_enabled(transformer, args)
+    transformer, use_gradlora = apply_gradlora_if_enabled(transformer, args)
+    transformer, use_oft = apply_oft_if_enabled(transformer, args)
+    use_peft = use_lora or use_gradlora or use_oft
+    adapter_type = (
+        "lora"
+        if use_lora
+        else "gradlora"
+        if use_gradlora
+        else "oft"
+        if use_oft
+        else None
+    )
     ema_model = deepcopy(transformer) if args.use_ema else None
     fsdp_kwargs, no_split_modules = get_dit_fsdp_kwargs(
         transformer,
         args.fsdp_sharding_startegy,
-        False,
+        use_peft,
         args.use_cpu_offload,
         args.master_weight_type,
     )
@@ -850,8 +948,169 @@ def run_training_sd35(args):
         if args.select_idx_seed is not None
         else None
     )
+    loader = _iter_sd35_loader(train_dataloader, device)
+    if use_gradlora:
+        calibration_batches = int(args.gradlora_calibration_batches)
+        if calibration_batches < 1:
+            raise ValueError(
+                "gradlora_calibration_batches must be at least 1, "
+                f"got {calibration_batches}"
+            )
+        calibration_mode = str(
+            getattr(args, "gradlora_calibration_mode", "sparse")
+        ).lower()
+        if calibration_mode not in {"sparse", "fullbp"}:
+            raise ValueError(
+                "gradlora_calibration_mode must be 'sparse' or 'fullbp', "
+                f"got {calibration_mode!r}"
+            )
+        fullbp_batch_size = int(
+            getattr(args, "gradlora_fullbp_batch_size", 1)
+        )
+        if fullbp_batch_size < 1:
+            raise ValueError(
+                "gradlora_fullbp_batch_size must be at least 1, "
+                f"got {fullbp_batch_size}"
+            )
+        use_second_moment = bool(
+            getattr(args, "gradlora_use_second_moment", False)
+        )
+        second_moment_beta = float(
+            getattr(args, "gradlora_second_moment_beta", 0.5)
+        )
+        if use_second_moment and not 0.0 < second_moment_beta <= 1.0:
+            raise ValueError(
+                "gradlora_second_moment_beta must be in (0, 1] when "
+                f"second-moment calibration is enabled, got {second_moment_beta}"
+            )
+        diagnostics_path = args.gradlora_diagnostics_path
+        if not diagnostics_path:
+            diagnostics_path = os.path.join(
+                args.output_dir or ".",
+                "gradlora_calibration.json",
+            )
+        main_print(
+            f"***** GradLoRA calibration: {calibration_batches} "
+            f"reward-backprop batches (mode={calibration_mode}, "
+            f"second_moment={use_second_moment}, "
+            f"beta={second_moment_beta if use_second_moment else 0.0}) *****"
+        )
+        calibrator = GradLoRACalibrator(
+            transformer,
+            accumulation_device=args.gradlora_accumulation_device,
+            offload_inputs=calibration_mode == "fullbp",
+            use_second_moment=use_second_moment,
+            second_moment_beta=second_moment_beta,
+            second_moment_rank=int(args.gradlora_rank),
+            second_moment_oversample=int(args.gradlora_svd_oversample),
+            moment_compute_device=args.gradlora_svd_device,
+        )
+        optimizer.zero_grad(set_to_none=True)
+        args.current_train_step = 0
+        nonzero_calibration_batches = 0
+        for calibration_step in range(calibration_batches):
+            avg_loss, avg_reward, _, _ = train_sd35_one_step(
+                args,
+                0,
+                device,
+                transformer,
+                vae,
+                fm_scheduler,
+                reward_model,
+                processor,
+                optimizer,
+                lr_scheduler,
+                loader,
+                preprocess_val,
+                select_idx_generator,
+                perform_optimizer_step=False,
+                trainer_override=(
+                    "fullbp" if calibration_mode == "fullbp" else None
+                ),
+                batch_size_override=(
+                    fullbp_batch_size if calibration_mode == "fullbp" else None
+                ),
+            )
+            calibrator.finish_batch()
+            optimizer.zero_grad(set_to_none=True)
+            main_print(
+                f"  GradLoRA calibration batch "
+                f"{calibration_step + 1}/{calibration_batches}: "
+                f"loss={avg_loss:.4f}, reward={avg_reward:.4f}"
+            )
+            if abs(float(avg_loss)) < 1e-12:
+                main_print(
+                    "[warning] GradLoRA calibration loss is ~0 "
+                    f"(reward={avg_reward:.4f}). ReLU clip may have zeroed "
+                    "all reward gradients; GradLoRA will fall back to random "
+                    "A on inactive layers."
+                )
+            else:
+                nonzero_calibration_batches += 1
+        if nonzero_calibration_batches == 0:
+            calibrator.close()
+            raise RuntimeError(
+                "Every GradLoRA calibration batch had zero reward loss, so no "
+                "reward-gradient direction can be estimated. Adjust "
+                "loss_relu_clip or the calibration data before retrying."
+            )
+        calibrator.finalize(
+            rank=int(args.gradlora_rank),
+            oversample=int(args.gradlora_svd_oversample),
+            niter=int(args.gradlora_svd_niter),
+            svd_device=args.gradlora_svd_device,
+            diagnostics_path=diagnostics_path,
+            metadata={
+                "calibration_mode": calibration_mode,
+                "calibration_batches": calibration_batches,
+                "use_second_moment": use_second_moment,
+                "second_moment_beta": (
+                    second_moment_beta if use_second_moment else 0.0
+                ),
+                "calibration_batch_size": (
+                    fullbp_batch_size
+                    if calibration_mode == "fullbp"
+                    else int(args.train_batch_size)
+                ),
+                "fullbp_full_cfg_grad": bool(
+                    getattr(args, "gradlora_fullbp_full_cfg_grad", False)
+                ),
+                "rollout_steps": int(
+                    getattr(args, "rollout_steps", None)
+                    or args.sampling_steps
+                    or 25
+                ),
+            },
+        )
+        optimizer.zero_grad(set_to_none=True)
+        if args.use_ema and ema_model is not None:
+            with torch.no_grad():
+                for target_param, source_param in zip(
+                    ema_model.parameters(),
+                    transformer.parameters(),
+                ):
+                    target_param.data.copy_(
+                        source_param.data.to(
+                            device=target_param.device,
+                            dtype=target_param.dtype,
+                        )
+                    )
+        main_print("***** GradLoRA calibration complete *****")
+
     if rank <= 0:
-        wandb.init(project=args.project, config=args, name=args.run_name)
+        wandb_tags = getattr(args, "wandb_tags", None)
+        if isinstance(wandb_tags, str):
+            wandb_tags = [tag.strip() for tag in wandb_tags.split(",") if tag.strip()]
+        elif wandb_tags is not None:
+            wandb_tags = [str(tag).strip() for tag in wandb_tags if str(tag).strip()]
+        else:
+            wandb_tags = None
+        wandb.init(
+            project=args.project,
+            config=args,
+            name=args.run_name,
+            tags=wandb_tags or None,
+        )
 
     total_batch_size = world_size * args.gradient_accumulation_steps * args.train_batch_size
     main_print("***** Running SD3.5 training *****")
@@ -862,7 +1121,6 @@ def run_training_sd35(args):
     main_print(f"  Total optimization steps = {args.max_train_steps}")
     main_print(f"  Master weight dtype: {next(transformer.parameters()).dtype}")
 
-    loader = _iter_sd35_loader(train_dataloader, device)
     progress_bar = tqdm(range(1, args.max_train_steps + 1), desc="Steps", disable=local_rank > 0)
     step_times = deque(maxlen=100)
 
@@ -899,7 +1157,17 @@ def run_training_sd35(args):
                 for tgt, src in zip(ema_model.parameters(), transformer.parameters()):
                     tgt.data.lerp_(src.data.to(tgt), 1 - args.ema_decay)
             if step % args.checkpointing_steps == 0:
-                save_checkpoint(transformer, rank, args.output_dir, step, epoch)
+                if use_peft:
+                    save_peft_checkpoint(
+                        transformer,
+                        rank,
+                        args.output_dir,
+                        step,
+                        epoch,
+                        adapter_type=adapter_type,
+                    )
+                else:
+                    save_checkpoint(transformer, rank, args.output_dir, step, epoch)
                 if args.use_ema:
                     save_sharded_ema_checkpoint(ema_model, rank, args.output_dir, step, epoch)
                 dist.barrier()
@@ -930,6 +1198,7 @@ def run_training_sd35(args):
                     rank,
                     world_size,
                     device,
+                    reward_model if selected_reward == "hpsv3plusplus" else None,
                 )
                 transformer.train()
 

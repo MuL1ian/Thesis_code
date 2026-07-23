@@ -28,6 +28,13 @@ from flowbp.dataset.latent_flux_rl_datasets import (
     LatentDataset,
     latent_collate_function,
 )
+from flowbp.rewards.differentiable import (
+    compute_differentiable_reward,
+    init_hpsv3plusplus_reward,
+    init_mps_reward,
+    reward_loss_values,
+    reward_model_type,
+)
 from flowbp.schedulers.fm_euler_discrete_with_pred_x0 import (
     FlowMatchEulerDiscreteWithPredX0Scheduler,
 )
@@ -354,25 +361,16 @@ def get_reward_loss(
         image_pred_x0 = vae.decode(latents_pred_x0, return_dict=False)[0]
         image_pred_x0 = (image_pred_x0 * 0.5 + 0.5).clamp(0, 1)
     
-    if args.use_hpsv2:
-        image_pred_x0 = preprocess_val(image_pred_x0)
-        # Process the prompt
-        text = tokenizer(caption).to(
-            device=image_pred_x0.device, non_blocking=True,
-        )
-        # Calculate the HPS
-        with torch.amp.autocast('cuda'):
-            outputs = reward_model(image_pred_x0, text)
-            image_features, text_features = outputs["image_features"], outputs["text_features"]
-            reward_pred_x0 = torch.einsum(
-                "bc,bc->b",
-                image_features,
-                text_features,
-            )
-    else:
-        raise NotImplementedError("Only HPSv2 is currently supported for reward computation.")
+    reward_pred_x0 = compute_differentiable_reward(
+        args,
+        image_pred_x0,
+        caption,
+        reward_model,
+        tokenizer,
+        preprocess_val,
+    )
     
-    reward_loss = F.relu(-reward_pred_x0 + args.loss_relu_clip) * args.loss_grad_scale
+    reward_loss = reward_loss_values(args, reward_pred_x0)
     if traj_sim_weight_factor is not None:
         reward_loss = reward_loss / traj_sim_weight_factor
     reward_loss = torch.mean(reward_loss)
@@ -521,13 +519,18 @@ def run_training(args):
     # For mixed precision training we cast all non-trainable weigths to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required
     preprocess_val = None
-    if args.use_hpsv2:
+    selected_reward = reward_model_type(args)
+    if selected_reward == "hpsv2":
         from hpsv2.src.open_clip import create_model_and_transforms, get_tokenizer
+        from flowbp.utils.hps_ckpt import ensure_hpsv2_ckpts
+
+        clip_path, hps_path = ensure_hpsv2_ckpts()
+
         def initialize_model():
             model_dict = {}
             model, preprocess_train, preprocess_val = create_model_and_transforms(
                 'ViT-H-14',
-                './hps_ckpt/open_clip_pytorch_model.bin',
+                clip_path,
                 precision='amp',
                 device=device,
                 jit=False,
@@ -551,17 +554,20 @@ def run_training(args):
         model = model_dict['model']
         preprocess_val = model_dict['preprocess_val']
         preprocess_val = HPSV2TransformsWithGrad(preprocess_val)
-        #cp = huggingface_hub.hf_hub_download("xswu/HPSv2", hps_version_map["v2.1"])
-        cp = "./hps_ckpt/HPS_v2.1_compressed.pt"
 
-        checkpoint = torch.load(cp, map_location=f'cuda:{device}')
+        checkpoint = torch.load(hps_path, map_location=f'cuda:{device}')
         model.load_state_dict(checkpoint['state_dict'])
         processor = get_tokenizer('ViT-H-14')
         reward_model = model.to(device)
         reward_model.requires_grad_(False)
         reward_model.eval()
+    elif selected_reward == "hpsv3plusplus":
+        reward_model, processor, preprocess_val = init_hpsv3plusplus_reward(
+            args, device
+        )
     else:
-        raise NotImplementedError("Only HPSv2 is currently supported as the reward model.")
+        reward_model, processor, preprocess_val = init_mps_reward(args, device)
+    main_print(f"--> differentiable reward: {selected_reward}")
 
     main_print(f"--> loading model from {args.pretrained_model_name_or_path}")
     # keep the master weight to float32
@@ -575,6 +581,11 @@ def run_training(args):
         args.pretrained_model_name_or_path,
         subfolder="scheduler",
     )
+    if bool(getattr(args, "use_gradlora", False)):
+        raise NotImplementedError(
+            "GradLoRA version 1 is integrated only in the SD3.5 trainer. "
+            "Use flowbp.train_flowbp_sd35 for calibration-aware training."
+        )
 
     ema_model = None
     if args.use_ema:
