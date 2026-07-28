@@ -280,6 +280,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--gradlora_spectral_exponent",
+        type=float,
+        default=0.0,
+        help=(
+            "Exponent p for GradLoRA A initialization: A is proportional to "
+            "spectrum**p times the right spectral vectors. The result is "
+            "globally row-RMS normalized, so p changes spectral shape but not "
+            "the original PEFT A scale."
+        ),
+    )
+    parser.add_argument(
         "--gradlora_accumulation_device",
         type=str,
         default="cpu",
@@ -295,6 +306,36 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--gradlora_svd_oversample", type=int, default=8)
     parser.add_argument("--gradlora_svd_niter", type=int, default=4)
+    parser.add_argument(
+        "--gradlora_init_variant",
+        type=str,
+        default="selected",
+        choices=("selected", "mean", "random"),
+        help=(
+            "Which subspace initializes LoRA A: the calibrated one, the "
+            "first-order mean-gradient control, or a same-rank random "
+            "control. Controls keep the original PEFT A row RMS."
+        ),
+    )
+    parser.add_argument(
+        "--gradlora_freeze_a",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Exclude lora_A from the optimizer after calibration so only B "
+            "trains, attributing reward differences to the chosen subspace."
+        ),
+    )
+    parser.add_argument(
+        "--gradlora_usefulness_batches",
+        type=int,
+        default=0,
+        help=(
+            "Extra held-out reward-backprop batches scored against the "
+            "calibrated subspace after finalization. Writes "
+            "<output_dir>/gradlora_usefulness.json. 0 disables the probe."
+        ),
+    )
     parser.add_argument(
         "--gradlora_diagnostics_path",
         type=str,

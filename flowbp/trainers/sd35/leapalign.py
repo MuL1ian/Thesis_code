@@ -731,6 +731,17 @@ def train_sd35_one_step(
         dist.all_reduce(metric_tensor.div_(args.gradient_accumulation_steps), op=dist.ReduceOp.AVG)
         reduced_traj_metrics[metric_name] = metric_tensor.item()
 
+    if bool(getattr(args, "gradlora_freeze_a", False)):
+        # A is intentionally kept requires_grad=True under FSDP, but it must
+        # neither accumulate across steps nor contribute to global norm
+        # clipping. B gradients are unaffected by clearing A after backward.
+        for name, parameter in transformer.named_parameters():
+            if ".lora_A." in name and parameter.grad is not None:
+                # Zero the view in place instead of assigning None: with
+                # use_orig_params=True this also clears A's segment in the
+                # underlying FSDP flat gradient used by clip_grad_norm_.
+                parameter.grad.zero_()
+
     if (
         perform_optimizer_step
         and (inner_step + 1) % args.gradient_accumulation_steps == 0
@@ -978,6 +989,9 @@ def run_training_sd35(args):
         second_moment_beta = float(
             getattr(args, "gradlora_second_moment_beta", 0.5)
         )
+        spectral_exponent = float(
+            getattr(args, "gradlora_spectral_exponent", 0.0)
+        )
         if use_second_moment and not 0.0 < second_moment_beta <= 1.0:
             raise ValueError(
                 "gradlora_second_moment_beta must be in (0, 1] when "
@@ -989,11 +1003,33 @@ def run_training_sd35(args):
                 args.output_dir or ".",
                 "gradlora_calibration.json",
             )
+        usefulness_batches = int(
+            getattr(args, "gradlora_usefulness_batches", 0) or 0
+        )
+        if usefulness_batches < 0:
+            raise ValueError(
+                "gradlora_usefulness_batches must be non-negative, "
+                f"got {usefulness_batches}"
+            )
+        usefulness_path = os.path.join(
+            args.output_dir or ".",
+            "gradlora_usefulness.json",
+        )
+        init_variant = str(
+            getattr(args, "gradlora_init_variant", "selected")
+        ).lower()
+        if init_variant not in {"selected", "mean", "random"}:
+            raise ValueError(
+                "gradlora_init_variant must be 'selected', 'mean', or "
+                f"'random', got {init_variant!r}"
+            )
+        freeze_a = bool(getattr(args, "gradlora_freeze_a", False))
         main_print(
             f"***** GradLoRA calibration: {calibration_batches} "
             f"reward-backprop batches (mode={calibration_mode}, "
             f"second_moment={use_second_moment}, "
-            f"beta={second_moment_beta if use_second_moment else 0.0}) *****"
+            f"beta={second_moment_beta if use_second_moment else 0.0}, "
+            f"spectral_exponent={spectral_exponent}) *****"
         )
         calibrator = GradLoRACalibrator(
             transformer,
@@ -1004,6 +1040,7 @@ def run_training_sd35(args):
             second_moment_rank=int(args.gradlora_rank),
             second_moment_oversample=int(args.gradlora_svd_oversample),
             moment_compute_device=args.gradlora_svd_device,
+            collect_probe_state=usefulness_batches > 0,
         )
         optimizer.zero_grad(set_to_none=True)
         args.current_train_step = 0
@@ -1056,17 +1093,22 @@ def run_training_sd35(args):
             )
         calibrator.finalize(
             rank=int(args.gradlora_rank),
+            spectral_exponent=spectral_exponent,
             oversample=int(args.gradlora_svd_oversample),
             niter=int(args.gradlora_svd_niter),
             svd_device=args.gradlora_svd_device,
+            init_variant=init_variant,
             diagnostics_path=diagnostics_path,
             metadata={
+                "init_variant": init_variant,
+                "freeze_a": freeze_a,
                 "calibration_mode": calibration_mode,
                 "calibration_batches": calibration_batches,
                 "use_second_moment": use_second_moment,
                 "second_moment_beta": (
                     second_moment_beta if use_second_moment else 0.0
                 ),
+                "spectral_exponent": spectral_exponent,
                 "calibration_batch_size": (
                     fullbp_batch_size
                     if calibration_mode == "fullbp"
@@ -1083,6 +1125,87 @@ def run_training_sd35(args):
             },
         )
         optimizer.zero_grad(set_to_none=True)
+        if usefulness_batches > 0:
+            main_print(
+                f"***** GradLoRA usefulness probe: {usefulness_batches} "
+                "held-out batches *****"
+            )
+            calibrator.begin_probe()
+            for probe_step in range(usefulness_batches):
+                avg_loss, avg_reward, _, _ = train_sd35_one_step(
+                    args,
+                    0,
+                    device,
+                    transformer,
+                    vae,
+                    fm_scheduler,
+                    reward_model,
+                    processor,
+                    optimizer,
+                    lr_scheduler,
+                    loader,
+                    preprocess_val,
+                    select_idx_generator,
+                    perform_optimizer_step=False,
+                    trainer_override=(
+                        "fullbp" if calibration_mode == "fullbp" else None
+                    ),
+                    batch_size_override=(
+                        fullbp_batch_size
+                        if calibration_mode == "fullbp"
+                        else None
+                    ),
+                )
+                calibrator.finish_batch()
+                optimizer.zero_grad(set_to_none=True)
+                main_print(
+                    f"  GradLoRA held-out batch "
+                    f"{probe_step + 1}/{usefulness_batches}: "
+                    f"loss={avg_loss:.4f}, reward={avg_reward:.4f}"
+                )
+            calibrator.finish_probe(
+                diagnostics_path=usefulness_path,
+                metadata={
+                    "init_variant": init_variant,
+                    "calibration_mode": calibration_mode,
+                    "calibration_batches": calibration_batches,
+                    "use_second_moment": use_second_moment,
+                    "second_moment_beta": (
+                        second_moment_beta if use_second_moment else 0.0
+                    ),
+                    "spectral_exponent": spectral_exponent,
+                    "rank": int(args.gradlora_rank),
+                },
+            )
+            optimizer.zero_grad(set_to_none=True)
+        if freeze_a:
+            # FSDP fixes per-flat-parameter requires_grad at wrap time, so drop
+            # A from the optimizer instead of flipping requires_grad. Gradients
+            # are cleared after backward and never applied to A.
+            frozen_parameter_ids: set[int] = set()
+            for name, parameter in transformer.named_parameters():
+                if parameter.requires_grad and ".lora_A." in name:
+                    frozen_parameter_ids.add(id(parameter))
+            if not frozen_parameter_ids:
+                raise RuntimeError(
+                    "Freezing GradLoRA A matched no lora_A parameter names"
+                )
+            kept = 0
+            for group in optimizer.param_groups:
+                group["params"] = [
+                    parameter
+                    for parameter in group["params"]
+                    if id(parameter) not in frozen_parameter_ids
+                ]
+                kept += len(group["params"])
+            if kept == 0:
+                raise RuntimeError(
+                    "Freezing GradLoRA A left no trainable parameter"
+                )
+            main_print(
+                f"--> GradLoRA froze {len(frozen_parameter_ids)} lora_A tensors "
+                f"({kept} optimizer tensors remain)"
+            )
         if args.use_ema and ema_model is not None:
             with torch.no_grad():
                 for target_param, source_param in zip(
