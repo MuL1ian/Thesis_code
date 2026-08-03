@@ -33,6 +33,9 @@ from flowbp.utils.peft_adapter import (
 )
 
 
+GRADLORA_A_SCALE_MODES = ("legacy", "relative", "gain")
+
+
 @dataclass
 class GradLoRALayerDiagnostic:
     name: str
@@ -46,6 +49,68 @@ class GradLoRALayerDiagnostic:
     sigma_max: float
     sigma_min_kept: float
     a_row_norm_scale: float
+    a_scale_mode: str = "legacy"
+    write_gain: float = 0.0
+
+
+def _adapter_scaling(module: nn.Module, adapter: str) -> float:
+    """Return the PEFT output scaling ``s`` applied to ``B @ A``."""
+    scaling = getattr(module, "scaling", None)
+    if isinstance(scaling, dict):
+        scaling = scaling.get(adapter)
+    if isinstance(scaling, torch.Tensor):
+        scaling = scaling.item()
+    if scaling is None:
+        raise ValueError(
+            f"GradLoRA could not read adapter scaling for {adapter!r}"
+        )
+    scaling = float(scaling)
+    if not math.isfinite(scaling) or scaling <= 0.0:
+        raise ValueError(
+            f"GradLoRA requires positive finite adapter scaling, got {scaling}"
+        )
+    return scaling
+
+
+def _resolve_a_row_scale(
+    module: nn.Module,
+    adapter: str,
+    mode: str,
+    scale: float,
+) -> tuple[float, float]:
+    """Return the ``(row_scale, write_gain)`` of this layer's A initializer.
+
+    B is exactly zero at initialization, so ``W0 + s * B @ A`` equals ``W0``
+    for every row scale and the scale costs nothing in function space. What it
+    does set is the first-step write gain ``g = s * c``: Adam moves B by about
+    the learning rate per coordinate irrespective of ``c``, so the induced
+    weight update grows linearly in ``c``. Conversely A's own relative update
+    rate falls as ``1 / c``, which drives large-``c`` runs toward the frozen-A
+    regime, so useful values of ``g`` are bounded on both sides.
+    """
+    if mode not in GRADLORA_A_SCALE_MODES:
+        raise ValueError(
+            "gradlora a_scale_mode must be one of "
+            f"{GRADLORA_A_SCALE_MODES}, got {mode!r}"
+        )
+    scaling = _adapter_scaling(module, adapter)
+    legacy = float(getattr(module, "_gradlora_a_row_norm", 1.0))
+    if mode == "legacy":
+        row_scale = legacy
+    else:
+        scale = float(scale)
+        if not math.isfinite(scale) or scale <= 0.0:
+            raise ValueError(
+                "gradlora a_scale must be finite and positive in "
+                f"{mode!r} mode, got {scale}"
+            )
+        row_scale = scale * legacy if mode == "relative" else scale / scaling
+    if not math.isfinite(row_scale) or row_scale <= 0.0:
+        raise ValueError(
+            "GradLoRA resolved a non-positive A row scale "
+            f"({row_scale}) in {mode!r} mode"
+        )
+    return row_scale, scaling * row_scale
 
 
 def _apply_spectral_exponent(
@@ -59,7 +124,7 @@ def _apply_spectral_exponent(
     ``initializer`` contains orthonormal right spectral vectors as rows.
     The spectrum is normalized by its maximum before exponentiation, so the
     operation depends only on relative spectral decay. A final global row-RMS
-    normalization preserves the scale of PEFT's original random LoRA A.
+    normalization preserves the target scale selected by the caller.
     """
 
     if not math.isfinite(exponent):
@@ -104,7 +169,7 @@ def _apply_spectral_exponent(
         weights[valid] = relative[valid].pow(exponent)
         result = result * weights.unsqueeze(1)
 
-    # Preserve PEFT's original global row-RMS so p changes relative spectral
+    # Preserve the requested global row-RMS so p changes relative spectral
     # weighting without changing the adapter's overall initialization scale.
     current_row_rms = result.norm() / math.sqrt(max(result.shape[0], 1))
     if not torch.isfinite(current_row_rms) or float(current_row_rms.item()) <= 0.0:
@@ -223,7 +288,21 @@ class GradLoRACalibrator:
         second_moment_oversample: int = 8,
         moment_compute_device: str = "cuda",
         collect_probe_state: bool = False,
+        a_scale_mode: str = "legacy",
+        a_scale: float = 1.0,
     ):
+        if a_scale_mode not in GRADLORA_A_SCALE_MODES:
+            raise ValueError(
+                "gradlora a_scale_mode must be one of "
+                f"{GRADLORA_A_SCALE_MODES}, got {a_scale_mode!r}"
+            )
+        if a_scale_mode != "legacy" and (
+            not math.isfinite(float(a_scale)) or float(a_scale) <= 0.0
+        ):
+            raise ValueError(
+                "gradlora a_scale must be finite and positive in "
+                f"{a_scale_mode!r} mode, got {a_scale}"
+            )
         if accumulation_device not in {"cpu", "cuda"}:
             raise ValueError(
                 "gradlora accumulation_device must be 'cpu' or 'cuda', "
@@ -257,6 +336,8 @@ class GradLoRACalibrator:
 
         self.model = model
         self.offload_inputs = bool(offload_inputs)
+        self.a_scale_mode = str(a_scale_mode)
+        self.a_scale = float(a_scale)
         self.use_second_moment = bool(use_second_moment)
         self.second_moment_beta = float(second_moment_beta)
         self.second_moment_rank = int(second_moment_rank)
@@ -534,7 +615,7 @@ class GradLoRACalibrator:
         ``init_variant`` swaps the subspace written into A for one of the
         controls the usefulness probe scores, so a frozen-A run can attribute
         reward differences to subspace choice alone. All variants keep the
-        original PEFT row RMS, so only the subspace differs.
+        row RMS selected by ``a_scale_mode``, so only the subspace differs.
         """
         if init_variant not in {"selected", "mean", "random"}:
             raise ValueError(
@@ -657,8 +738,11 @@ class GradLoRACalibrator:
                         f"GradLoRA second moment for {name} contains "
                         "non-finite values"
                     )
-            row_scale = float(
-                getattr(self.modules[name], "_gradlora_a_row_norm", 1.0)
+            row_scale, write_gain = _resolve_a_row_scale(
+                self.modules[name],
+                _active_adapter_name(self.modules[name]),
+                self.a_scale_mode,
+                self.a_scale,
             )
             init_a: torch.Tensor | None = None
             mean_a: torch.Tensor | None = None
@@ -883,6 +967,8 @@ class GradLoRACalibrator:
                         sigma_max=sigma_max,
                         sigma_min_kept=sigma_min_kept,
                         a_row_norm_scale=row_scale,
+                        a_scale_mode=self.a_scale_mode,
+                        write_gain=write_gain,
                     )
                 )
             del gradient
@@ -922,6 +1008,8 @@ class GradLoRACalibrator:
                     if self.use_second_moment
                     else 0.0
                 ),
+                "a_scale_mode": self.a_scale_mode,
+                "a_scale": self.a_scale,
                 "layers": [asdict(item) for item in diagnostics],
             }
             if metadata:

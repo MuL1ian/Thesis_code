@@ -13,6 +13,7 @@ NNODES="${NNODES:-${HOST_NUM:-1}}"
 NODE_RANK="${NODE_RANK:-${INDEX:-0}}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-${HOST_GPU_NUM:-8}}"
 TORCHRUN_EXTRA_ARGS="${TORCHRUN_EXTRA_ARGS:-}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
 
 if [[ "$NNODES" == "1" ]]; then
     distributed_args=(--standalone)
@@ -20,7 +21,7 @@ else
     distributed_args=(--master_addr="$MASTER_ADDR" --master_port="$MASTER_PORT")
 fi
 
-torchrun \
+"$PYTHON_BIN" -m torch.distributed.run \
     --node_rank="$NODE_RANK" \
     --nproc_per_node="$NPROC_PER_NODE" \
     --nnodes="$NNODES" \

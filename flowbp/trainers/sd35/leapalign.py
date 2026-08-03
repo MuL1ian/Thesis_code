@@ -53,6 +53,14 @@ from flowbp.utils.gradlora_adapter import (
 )
 from flowbp.utils.hpsv2_transforms import HPSV2TransformsWithGrad
 from flowbp.utils.logging_ import main_print
+from flowbp.utils.loraga_adapter import (
+    LoRAGACalibrator,
+    apply_loraga_if_enabled,
+)
+from flowbp.utils.lorapro_optimizer import (
+    LoRAProOptimizer,
+    discover_peft_lora_pairs,
+)
 from flowbp.utils.peft_adapter import (
     apply_lora_if_enabled,
     apply_oft_if_enabled,
@@ -97,6 +105,36 @@ def _iter_sd35_loader(dataloader, device):
             )
         if isinstance(dataloader.sampler, DistributedSampler):
             dataloader.sampler.set_epoch(dataloader.sampler.epoch + 1)
+
+
+@torch.no_grad()
+def _prepare_lorapro_ignored_parameters(model, device):
+    """Keep complete LoRA-Pro factors outside FSDP and synchronize rank 0."""
+    target_device = torch.device("cuda", int(device))
+    parameters = []
+    seen = set()
+    for pair in discover_peft_lora_pairs(model):
+        for parameter in (pair.a, pair.b):
+            if id(parameter) in seen:
+                continue
+            seen.add(id(parameter))
+            parameter.data = parameter.data.to(target_device)
+            if dist.is_available() and dist.is_initialized():
+                dist.broadcast(parameter.data, src=0)
+            parameters.append(parameter)
+    return parameters
+
+
+def _save_lorapro_optimizer_shard(optimizer, output_dir, step, epoch, rank):
+    save_dir = os.path.join(
+        output_dir,
+        f"lorapro-optimizer-checkpoint-{step}-{epoch}",
+    )
+    os.makedirs(save_dir, exist_ok=True)
+    torch.save(
+        optimizer.state_dict(),
+        os.path.join(save_dir, f"rank-{rank}.pt"),
+    )
 
 
 def _sample_initial_latents(args, transformer, device, batch_size):
@@ -746,12 +784,24 @@ def train_sd35_one_step(
         perform_optimizer_step
         and (inner_step + 1) % args.gradient_accumulation_steps == 0
     ):
-        grad_norm = transformer.clip_grad_norm_(args.max_grad_norm)
-        _align_grad_dtype_to_param_dtype(transformer)
-        optimizer.step()
+        if bool(getattr(args, "use_lora_pro", False)):
+            optimizer.step()
+            diagnostics = optimizer.get_step_diagnostics()
+            grad_norm = float(diagnostics["raw_grad_norm"])
+            reduced_traj_metrics.update(
+                {
+                    f"lorapro_{name}": value
+                    for name, value in diagnostics.items()
+                    if isinstance(value, (int, float))
+                }
+            )
+        else:
+            grad_norm = transformer.clip_grad_norm_(args.max_grad_norm)
+            _align_grad_dtype_to_param_dtype(transformer)
+            optimizer.step()
+            grad_norm = grad_norm.item()
         lr_scheduler.step()
         optimizer.zero_grad()
-        grad_norm = grad_norm.item()
     else:
         grad_norm = None
     return avg_loss.item(), avg_reward_pred_x0.item(), grad_norm, reduced_traj_metrics
@@ -875,27 +925,43 @@ def run_training_sd35(args):
         for name, enabled in (
             ("lora", args.use_lora),
             ("gradlora", args.use_gradlora),
+            ("loraga", args.use_loraga),
             ("oft", args.use_oft),
         )
         if enabled
     ]
     if len(enabled_adapters) > 1:
         raise ValueError(
-            "LoRA, GradLoRA, and OFT are mutually exclusive; "
+            "LoRA, GradLoRA, LoRA-GA, and OFT are mutually exclusive; "
             "enable only one. "
             f"Enabled: {enabled_adapters}"
         )
+    if bool(getattr(args, "use_lora_pro", False)) and not bool(args.use_lora):
+        raise ValueError("LoRA-Pro requires lora.enabled=true")
+    if bool(getattr(args, "use_lora_pro", False)) and float(args.weight_decay) != 0.0:
+        raise ValueError("LoRA-Pro requires optimizer.weight_decay=0")
     transformer, use_lora = apply_lora_if_enabled(transformer, args)
     transformer, use_gradlora = apply_gradlora_if_enabled(transformer, args)
+    transformer, use_loraga = apply_loraga_if_enabled(transformer, args)
     transformer, use_oft = apply_oft_if_enabled(transformer, args)
-    use_peft = use_lora or use_gradlora or use_oft
+    use_lora_pro = bool(getattr(args, "use_lora_pro", False))
+    use_peft = use_lora or use_gradlora or use_loraga or use_oft
     adapter_type = (
-        "lora"
+        "lorapro"
+        if use_lora_pro
+        else "lora"
         if use_lora
         else "gradlora"
         if use_gradlora
+        else "loraga"
+        if use_loraga
         else "oft"
         if use_oft
+        else None
+    )
+    lorapro_ignored_parameters = (
+        _prepare_lorapro_ignored_parameters(transformer, device)
+        if use_lora_pro
         else None
     )
     ema_model = deepcopy(transformer) if args.use_ema else None
@@ -905,10 +971,24 @@ def run_training_sd35(args):
         use_peft,
         args.use_cpu_offload,
         args.master_weight_type,
+        ignored_states=lorapro_ignored_parameters,
     )
     transformer = FSDP(transformer, **fsdp_kwargs)
     if args.use_ema and ema_model is not None:
-        ema_model = FSDP(ema_model, **fsdp_kwargs)
+        ema_ignored_parameters = (
+            _prepare_lorapro_ignored_parameters(ema_model, device)
+            if use_lora_pro
+            else None
+        )
+        ema_fsdp_kwargs, _ = get_dit_fsdp_kwargs(
+            ema_model,
+            args.fsdp_sharding_startegy,
+            use_peft,
+            args.use_cpu_offload,
+            args.master_weight_type,
+            ignored_states=ema_ignored_parameters,
+        )
+        ema_model = FSDP(ema_model, **ema_fsdp_kwargs)
         ema_model.eval()
         ema_model.requires_grad_(False)
     if args.gradient_checkpointing:
@@ -923,16 +1003,29 @@ def run_training_sd35(args):
     vae.eval()
     transformer.train()
 
-    params_to_optimize = [p for p in transformer.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(
-        params_to_optimize,
-        lr=args.learning_rate,
-        betas=(0.9, 0.999),
-        weight_decay=args.weight_decay,
-        eps=1e-8,
-        fused=False,
-        foreach=False,
-    )
+    if use_lora_pro:
+        optimizer = LoRAProOptimizer(
+            transformer,
+            lr=args.learning_rate,
+            betas=(0.9, 0.999),
+            eps=1e-8,
+            weight_decay=0.0,
+            damping=float(args.lora_pro_damping),
+            rcond=args.lora_pro_rcond,
+            max_grad_norm=float(args.max_grad_norm),
+            shard_dense_states=bool(args.lora_pro_shard_dense_states),
+        )
+    else:
+        params_to_optimize = [p for p in transformer.parameters() if p.requires_grad]
+        optimizer = torch.optim.AdamW(
+            params_to_optimize,
+            lr=args.learning_rate,
+            betas=(0.9, 0.999),
+            weight_decay=args.weight_decay,
+            eps=1e-8,
+            fused=False,
+            foreach=False,
+        )
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
         optimizer=optimizer,
@@ -960,6 +1053,107 @@ def run_training_sd35(args):
         else None
     )
     loader = _iter_sd35_loader(train_dataloader, device)
+    if use_loraga:
+        calibration_batches = int(args.loraga_calibration_batches)
+        if calibration_batches < 1:
+            raise ValueError("loraga_calibration_batches must be at least 1")
+        calibration_mode = str(args.loraga_calibration_mode).lower()
+        if calibration_mode not in {"sparse", "fullbp"}:
+            raise ValueError(
+                "loraga_calibration_mode must be 'sparse' or 'fullbp'"
+            )
+        fullbp_batch_size = int(args.loraga_fullbp_batch_size)
+        if fullbp_batch_size < 1:
+            raise ValueError("loraga_fullbp_batch_size must be at least 1")
+        diagnostics_path = args.loraga_diagnostics_path or os.path.join(
+            args.output_dir or ".",
+            "loraga_calibration.json",
+        )
+        main_print(
+            f"***** LoRA-GA calibration: {calibration_batches} "
+            f"reward-backprop batches (mode={calibration_mode}, "
+            f"gamma={args.loraga_stable_gamma}, "
+            f"use_rslora={args.loraga_use_rslora}) *****"
+        )
+        calibrator = LoRAGACalibrator(
+            transformer,
+            accumulation_device=args.loraga_accumulation_device,
+            offload_inputs=calibration_mode == "fullbp",
+        )
+        optimizer.zero_grad(set_to_none=True)
+        args.current_train_step = 0
+        nonzero_calibration_batches = 0
+        for calibration_step in range(calibration_batches):
+            avg_loss, avg_reward, _, _ = train_sd35_one_step(
+                args,
+                0,
+                device,
+                transformer,
+                vae,
+                fm_scheduler,
+                reward_model,
+                processor,
+                optimizer,
+                lr_scheduler,
+                loader,
+                preprocess_val,
+                select_idx_generator,
+                perform_optimizer_step=False,
+                trainer_override=(
+                    "fullbp" if calibration_mode == "fullbp" else None
+                ),
+                batch_size_override=(
+                    fullbp_batch_size if calibration_mode == "fullbp" else None
+                ),
+            )
+            optimizer.zero_grad(set_to_none=True)
+            main_print(
+                f"  LoRA-GA calibration batch "
+                f"{calibration_step + 1}/{calibration_batches}: "
+                f"loss={avg_loss:.4f}, reward={avg_reward:.4f}"
+            )
+            if abs(float(avg_loss)) >= 1e-12:
+                nonzero_calibration_batches += 1
+        if nonzero_calibration_batches == 0:
+            calibrator.close()
+            raise RuntimeError(
+                "Every LoRA-GA calibration batch had zero reward loss"
+            )
+        calibrator.finalize(
+            rank=int(args.loraga_rank),
+            oversample=int(args.loraga_svd_oversample),
+            niter=int(args.loraga_svd_niter),
+            svd_device=args.loraga_svd_device,
+            diagnostics_path=diagnostics_path,
+            metadata={
+                "calibration_mode": calibration_mode,
+                "calibration_batches": calibration_batches,
+                "calibration_batch_size": (
+                    fullbp_batch_size
+                    if calibration_mode == "fullbp"
+                    else int(args.train_batch_size)
+                ),
+                "fullbp_full_cfg_grad": bool(
+                    args.loraga_fullbp_full_cfg_grad
+                ),
+                "stable_gamma": float(args.loraga_stable_gamma),
+                "use_rslora": bool(args.loraga_use_rslora),
+            },
+        )
+        optimizer.zero_grad(set_to_none=True)
+        if args.use_ema and ema_model is not None:
+            with torch.no_grad():
+                for target_param, source_param in zip(
+                    ema_model.parameters(),
+                    transformer.parameters(),
+                ):
+                    target_param.data.copy_(
+                        source_param.data.to(
+                            device=target_param.device,
+                            dtype=target_param.dtype,
+                        )
+                    )
+        main_print("***** LoRA-GA calibration complete *****")
     if use_gradlora:
         calibration_batches = int(args.gradlora_calibration_batches)
         if calibration_batches < 1:
@@ -1023,13 +1217,18 @@ def run_training_sd35(args):
                 "gradlora_init_variant must be 'selected', 'mean', or "
                 f"'random', got {init_variant!r}"
             )
+        a_scale_mode = str(
+            getattr(args, "gradlora_a_scale_mode", "legacy")
+        ).lower()
+        a_scale = float(getattr(args, "gradlora_a_scale", 1.0))
         freeze_a = bool(getattr(args, "gradlora_freeze_a", False))
         main_print(
             f"***** GradLoRA calibration: {calibration_batches} "
             f"reward-backprop batches (mode={calibration_mode}, "
             f"second_moment={use_second_moment}, "
             f"beta={second_moment_beta if use_second_moment else 0.0}, "
-            f"spectral_exponent={spectral_exponent}) *****"
+            f"spectral_exponent={spectral_exponent}, "
+            f"a_scale_mode={a_scale_mode}, a_scale={a_scale}) *****"
         )
         calibrator = GradLoRACalibrator(
             transformer,
@@ -1041,6 +1240,8 @@ def run_training_sd35(args):
             second_moment_oversample=int(args.gradlora_svd_oversample),
             moment_compute_device=args.gradlora_svd_device,
             collect_probe_state=usefulness_batches > 0,
+            a_scale_mode=a_scale_mode,
+            a_scale=a_scale,
         )
         optimizer.zero_grad(set_to_none=True)
         args.current_train_step = 0
@@ -1291,6 +1492,14 @@ def run_training_sd35(args):
                     )
                 else:
                     save_checkpoint(transformer, rank, args.output_dir, step, epoch)
+                if use_lora_pro and bool(args.lora_pro_save_optimizer_state):
+                    _save_lorapro_optimizer_shard(
+                        optimizer,
+                        args.output_dir,
+                        step,
+                        epoch,
+                        rank,
+                    )
                 if args.use_ema:
                     save_sharded_ema_checkpoint(ema_model, rank, args.output_dir, step, epoch)
                 dist.barrier()
@@ -1311,7 +1520,8 @@ def run_training_sd35(args):
                 wandb.log(log_dict, step=step)
             progress_bar.update(1)
 
-            if step % args.evaluation_interval == 0 or step == 1:
+            eval_interval = int(getattr(args, "evaluation_interval", 0) or 0)
+            if eval_interval > 0 and (step % eval_interval == 0 or step == 1):
                 transformer.eval()
                 run_online_sd35_eval(
                     step,

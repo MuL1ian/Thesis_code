@@ -103,6 +103,7 @@ def get_dit_fsdp_kwargs(
     use_lora=False,
     cpu_offload=False,
     master_weight_type="fp32",
+    ignored_states=None,
 ):
     no_split_modules = get_no_split_modules(transformer)
     auto_wrap_policy = functools.partial(
@@ -142,6 +143,8 @@ def get_dit_fsdp_kwargs(
             "use_orig_params": True,
             "sync_module_states": True,
         })
+    if ignored_states:
+        fsdp_kwargs["ignored_states"] = list(ignored_states)
 
     return fsdp_kwargs, no_split_modules
 

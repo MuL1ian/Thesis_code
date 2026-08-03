@@ -83,10 +83,12 @@ def apply_lora_if_enabled(transformer, args):
     target_modules = _split_target_modules(getattr(args, "lora_target_modules", None))
     target_modules = _validate_target_modules(transformer, target_modules)
     base_config = getattr(transformer, "config", None)
+    use_rslora = bool(getattr(args, "lora_use_rslora", False))
     main_print(
         "--> applying LoRA adapter "
         f"(rank={args.lora_rank}, alpha={args.lora_alpha}, "
-        f"dropout={args.lora_dropout}, targets={target_modules})"
+        f"dropout={args.lora_dropout}, use_rslora={use_rslora}, "
+        f"targets={target_modules})"
     )
     transformer = get_peft_model(
         transformer,
@@ -97,6 +99,7 @@ def apply_lora_if_enabled(transformer, args):
             target_modules=target_modules,
             bias="none",
             task_type=None,
+            use_rslora=use_rslora,
         ),
     )
 

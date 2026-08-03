@@ -59,6 +59,7 @@ def sample_fullbp_trajectory_sd35(
     latents_pred_x0 = None
     full_cfg_grad = bool(
         getattr(args, "gradlora_fullbp_full_cfg_grad", False)
+        or getattr(args, "loraga_fullbp_full_cfg_grad", False)
     )
     for idx, step_t in enumerate(timesteps):
         pred = _model_forward_sd35(

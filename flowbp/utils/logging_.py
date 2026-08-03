@@ -4,7 +4,7 @@ import sys
 
 
 def main_print(content):
-    if int(os.environ["LOCAL_RANK"]) <= 0:
+    if int(os.environ.get("LOCAL_RANK", "0")) <= 0:
         print(content)
 
 

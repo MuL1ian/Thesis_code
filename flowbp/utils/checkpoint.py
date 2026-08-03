@@ -1,4 +1,6 @@
+import copy
 import json
+import math
 import os
 
 import torch
@@ -12,6 +14,143 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import StateDictType
 
 from flowbp.utils.logging_ import main_print
+
+
+def _state_key_ending_with(state_dict, suffix):
+    matches = [key for key in state_dict if key.endswith(suffix)]
+    if len(matches) != 1:
+        raise KeyError(
+            f"Expected one state-dict key ending with {suffix!r}, got {matches}"
+        )
+    return matches[0]
+
+
+def _canonical_module_name(module_name):
+    """Remove wrapper-only path segments omitted by FSDP full state dicts."""
+    wrapper_segments = {
+        "_fsdp_wrapped_module",
+        "_checkpoint_wrapped_module",
+    }
+    return ".".join(
+        segment
+        for segment in str(module_name).split(".")
+        if segment not in wrapper_segments
+    )
+
+
+def _save_portable_loraga_checkpoint(
+    peft_model,
+    full_state_dict,
+    save_dir,
+    step,
+    epoch,
+):
+    """Save LoRA-GA relative to the original base as standard rank-2r LoRA."""
+    from flowbp.utils.gradlora_adapter import (
+        _active_adapter_name,
+        _is_lora_linear,
+    )
+    from flowbp.utils.loraga_adapter import (
+        LORAGA_INIT_A_ATTR,
+        LORAGA_INIT_B_ATTR,
+        convert_loraga_to_portable_factors,
+    )
+
+    portable_state = dict(full_state_dict)
+    init_state = {}
+    adapters = set()
+    original_rank = None
+    for module_name, module in peft_model.named_modules():
+        if not _is_lora_linear(module):
+            continue
+        adapter = _active_adapter_name(module)
+        adapters.add(adapter)
+        state_module_name = _canonical_module_name(module_name)
+        a_suffix = f"{state_module_name}.lora_A.{adapter}.weight"
+        b_suffix = f"{state_module_name}.lora_B.{adapter}.weight"
+        a_key = _state_key_ending_with(portable_state, a_suffix)
+        b_key = _state_key_ending_with(portable_state, b_suffix)
+        init_a = getattr(module, LORAGA_INIT_A_ATTR, None)
+        init_b = getattr(module, LORAGA_INIT_B_ATTR, None)
+        if not isinstance(init_a, torch.Tensor) or not isinstance(
+            init_b, torch.Tensor
+        ):
+            raise RuntimeError(
+                f"LoRA-GA layer {module_name} is missing initial factors"
+            )
+        final_a = portable_state[a_key].detach().cpu()
+        final_b = portable_state[b_key].detach().cpu()
+        portable_a, portable_b = convert_loraga_to_portable_factors(
+            final_a,
+            final_b,
+            init_a,
+            init_b,
+        )
+        portable_state[a_key] = portable_a
+        portable_state[b_key] = portable_b
+        init_state[a_key] = init_a
+        init_state[b_key] = init_b
+        layer_rank = int(final_a.shape[0])
+        if original_rank is None:
+            original_rank = layer_rank
+        elif original_rank != layer_rank:
+            raise RuntimeError("Portable LoRA-GA requires a uniform adapter rank")
+
+    if not adapters or original_rank is None:
+        raise RuntimeError("Portable LoRA-GA save found no initialized layers")
+    if len(adapters) != 1:
+        raise RuntimeError(
+            f"Portable LoRA-GA currently supports one adapter, got {adapters}"
+        )
+    adapter = next(iter(adapters))
+    config = peft_model.peft_config[adapter]
+    original_config = copy.deepcopy(config)
+    use_rslora = bool(getattr(config, "use_rslora", False))
+    alpha = float(config.lora_alpha)
+    portable_alpha = alpha * (math.sqrt(2.0) if use_rslora else 2.0)
+    try:
+        config.r = 2 * original_rank
+        config.lora_alpha = portable_alpha
+        rank_pattern = getattr(config, "rank_pattern", None)
+        if isinstance(rank_pattern, dict):
+            config.rank_pattern = {
+                key: 2 * int(value) for key, value in rank_pattern.items()
+            }
+        alpha_pattern = getattr(config, "alpha_pattern", None)
+        if isinstance(alpha_pattern, dict):
+            factor = math.sqrt(2.0) if use_rslora else 2.0
+            config.alpha_pattern = {
+                key: float(value) * factor
+                for key, value in alpha_pattern.items()
+            }
+        peft_model.save_pretrained(
+            save_dir,
+            state_dict=portable_state,
+            safe_serialization=True,
+            is_main_process=True,
+        )
+    finally:
+        peft_model.peft_config[adapter] = original_config
+
+    save_file(
+        {key: value.contiguous() for key, value in init_state.items()},
+        os.path.join(save_dir, "loraga_initial_factors.safetensors"),
+    )
+    with open(os.path.join(save_dir, "training_state.json"), "w") as f:
+        json.dump(
+            {
+                "step": step,
+                "epoch": epoch,
+                "adapter_type": "loraga",
+                "training_rank": original_rank,
+                "portable_rank": 2 * original_rank,
+                "training_alpha": alpha,
+                "portable_alpha": portable_alpha,
+                "use_rslora": use_rslora,
+            },
+            f,
+            indent=4,
+        )
 
 
 def _unwrap_model_config(model):
@@ -124,18 +263,27 @@ def save_peft_checkpoint(
             output_dir, f"{adapter_type}-checkpoint-{step}-{epoch}"
         )
         os.makedirs(save_dir, exist_ok=True)
-        peft_model.save_pretrained(
-            save_dir,
-            state_dict=full_state_dict,
-            safe_serialization=True,
-            is_main_process=True,
-        )
-        with open(os.path.join(save_dir, "training_state.json"), "w") as f:
-            json.dump(
-                {"step": step, "epoch": epoch, "adapter_type": adapter_type},
-                f,
-                indent=4,
+        if adapter_type == "loraga":
+            _save_portable_loraga_checkpoint(
+                peft_model,
+                full_state_dict,
+                save_dir,
+                step,
+                epoch,
             )
+        else:
+            peft_model.save_pretrained(
+                save_dir,
+                state_dict=full_state_dict,
+                safe_serialization=True,
+                is_main_process=True,
+            )
+            with open(os.path.join(save_dir, "training_state.json"), "w") as f:
+                json.dump(
+                    {"step": step, "epoch": epoch, "adapter_type": adapter_type},
+                    f,
+                    indent=4,
+                )
     main_print(f"--> {adapter_type.upper()} checkpoint saved at step {step}")
 
 

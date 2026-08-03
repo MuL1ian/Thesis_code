@@ -212,6 +212,74 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lora_alpha", type=float, default=64.0)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
     parser.add_argument(
+        "--lora_use_rslora",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use rank-stabilized alpha/sqrt(rank) LoRA scaling.",
+    )
+    parser.add_argument(
+        "--use_loraga",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use LoRA-GA reward-gradient initialization in the SD3.5 trainer.",
+    )
+    parser.add_argument("--loraga_target_modules", type=str, default="default")
+    parser.add_argument("--loraga_rank", type=int, default=32)
+    parser.add_argument("--loraga_alpha", type=float, default=64.0)
+    parser.add_argument("--loraga_dropout", type=float, default=0.0)
+    parser.add_argument(
+        "--loraga_use_rslora",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--loraga_stable_gamma", type=float, default=16.0)
+    parser.add_argument("--loraga_calibration_batches", type=int, default=4)
+    parser.add_argument(
+        "--loraga_calibration_mode",
+        type=str,
+        default="sparse",
+        choices=("sparse", "fullbp"),
+    )
+    parser.add_argument("--loraga_fullbp_batch_size", type=int, default=1)
+    parser.add_argument(
+        "--loraga_fullbp_full_cfg_grad",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--loraga_accumulation_device",
+        type=str,
+        default="cpu",
+        choices=("cpu", "cuda"),
+    )
+    parser.add_argument(
+        "--loraga_svd_device",
+        type=str,
+        default="cuda",
+        choices=("cpu", "cuda"),
+    )
+    parser.add_argument("--loraga_svd_oversample", type=int, default=32)
+    parser.add_argument("--loraga_svd_niter", type=int, default=4)
+    parser.add_argument("--loraga_diagnostics_path", type=str, default=None)
+    parser.add_argument(
+        "--use_lora_pro",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Optimize an enabled standard LoRA adapter with LoRA-Pro.",
+    )
+    parser.add_argument("--lora_pro_damping", type=float, default=1e-6)
+    parser.add_argument("--lora_pro_rcond", type=float, default=None)
+    parser.add_argument(
+        "--lora_pro_shard_dense_states",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--lora_pro_save_optimizer_state",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
         "--use_gradlora",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -288,6 +356,29 @@ def build_parser() -> argparse.ArgumentParser:
             "spectrum**p times the right spectral vectors. The result is "
             "globally row-RMS normalized, so p changes spectral shape but not "
             "the original PEFT A scale."
+        ),
+    )
+    parser.add_argument(
+        "--gradlora_a_scale_mode",
+        type=str,
+        default="legacy",
+        choices=("legacy", "relative", "gain"),
+        help=(
+            "How the GradLoRA A row scale c is chosen. 'legacy' keeps PEFT's "
+            "random Kaiming row RMS, 'relative' multiplies it by "
+            "--gradlora_a_scale, and 'gain' sets c so the write gain "
+            "s*c equals --gradlora_a_scale. B starts at zero in every mode, so "
+            "the model function is unchanged regardless of c."
+        ),
+    )
+    parser.add_argument(
+        "--gradlora_a_scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Multiplier ('relative' mode) or target write gain s*c ('gain' "
+            "mode) for the GradLoRA A initializer. Ignored when "
+            "--gradlora_a_scale_mode is 'legacy'."
         ),
     )
     parser.add_argument(
