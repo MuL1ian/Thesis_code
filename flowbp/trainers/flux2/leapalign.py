@@ -813,13 +813,12 @@ def train_one_step(
     # ``--no-cfg_grad_norm_compensate`` (yaml: flux2.cfg_grad_norm_compensate);
     # with the flag disabled the raw cfg-amplified gradient is
     # used (equivalent to setting LR = base_lr * cfg_guidance).
+    backward_factor = 1.0 / args.gradient_accumulation_steps
     cfg_scale = float(getattr(args, "cfg_guidance", 1.0))
     cfg_compensate = bool(getattr(args, "cfg_grad_norm_compensate", True))
     if cfg_scale > 1.0 and cfg_compensate:
-        backward_loss = loss / cfg_scale
-    else:
-        backward_loss = loss
-    backward_loss.backward()
+        backward_factor = backward_factor / cfg_scale
+    (loss * backward_factor).backward()
     dist.all_reduce(
         avg_loss.div_(args.gradient_accumulation_steps),
         op=dist.ReduceOp.AVG,

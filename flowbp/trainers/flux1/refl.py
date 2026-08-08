@@ -240,7 +240,7 @@ def train_refl_one_step(
         traj_sim_weight_factor,
     )
 
-    loss.backward()
+    (loss / args.gradient_accumulation_steps).backward()
     avg_loss = loss.detach()
     dist.all_reduce(
         avg_loss.div_(args.gradient_accumulation_steps),

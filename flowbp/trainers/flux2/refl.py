@@ -246,13 +246,12 @@ def train_refl_one_step_flux2(
     # gradient compensation below.
     avg_loss = loss.detach()
 
+    backward_factor = 1.0 / args.gradient_accumulation_steps
     cfg_scale = float(getattr(args, "cfg_guidance", 1.0))
     cfg_compensate = bool(getattr(args, "cfg_grad_norm_compensate", True))
     if cfg_scale > 1.0 and cfg_compensate:
-        backward_loss = loss / cfg_scale
-    else:
-        backward_loss = loss
-    backward_loss.backward()
+        backward_factor = backward_factor / cfg_scale
+    (loss * backward_factor).backward()
 
     dist.all_reduce(
         avg_loss.div_(args.gradient_accumulation_steps),

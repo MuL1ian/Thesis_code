@@ -857,6 +857,7 @@ def run_training_sd35(args):
     trainer_name = normalize_sd35_trainer_name(getattr(args, "trainer", "leapalign"))
     args.trainer = trainer_name
     if trainer_name not in {
+        "fullbp",
         "leapalign",
         "refl",
         "flowbp_lagrange",
@@ -868,7 +869,7 @@ def run_training_sd35(args):
         raise ValueError(
             "SD3.5 trainer supports FlowBP method names (flowbp_sparse, "
             "flowbp_bridge, flowbp_lagrange) and baselines "
-            "(leapalign, refl, draft_lv, drtune)."
+            "(fullbp, leapalign, refl, draft_lv, drtune)."
         )
     if int(getattr(args, "sp_size", 1)) != 1:
         raise NotImplementedError("SD3.5 trainer currently supports sp_size=1 only.")

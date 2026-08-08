@@ -44,6 +44,10 @@ def main() -> None:
     )
 
     trainer_map = {
+        # FullBP is exposed for memory/throughput benchmarking. Its sampler
+        # differentiates through the complete rollout and is usually too
+        # memory-intensive for regular training.
+        "fullbp": LeapAlignSD35Trainer,
         "leapalign": LeapAlignSD35Trainer,
         "refl": LeapAlignReFLSD35Trainer,
         "flowbp_lagrange": FlowBPLagrangeSD35Trainer,
@@ -55,7 +59,7 @@ def main() -> None:
     trainer_name = normalize_sd35_trainer_name(args.trainer)
     if trainer_name not in trainer_map:
         raise ValueError(
-            "SD3.5 entrypoint supports flowbp_sparse/flowbp_bridge/"
+            "SD3.5 entrypoint supports fullbp/flowbp_sparse/flowbp_bridge/"
             "flowbp_lagrange and baselines leapalign/refl/draft_lv/drtune, "
             f"got {args.trainer!r}."
         )

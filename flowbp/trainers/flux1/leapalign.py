@@ -434,7 +434,7 @@ def train_one_step(
         traj_sim_weight_factor,
     )
 
-    loss.backward()
+    (loss / args.gradient_accumulation_steps).backward()
     avg_loss = loss.detach()
     dist.all_reduce(
         avg_loss.div_(args.gradient_accumulation_steps), 
@@ -857,6 +857,7 @@ def run_training(args):
                     rank,
                     world_size,
                     device,
+                    reward_model if selected_reward == "hpsv3plusplus" else None,
                 )
                 transformer.train()
 

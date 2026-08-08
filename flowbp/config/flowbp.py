@@ -270,6 +270,7 @@ TRAINER_ALIASES = {
 }
 
 FLOWBP_TRAINER_CHOICES = [
+    "fullbp",
     "leapalign",
     "refl",
     "draft_lv",
@@ -280,6 +281,7 @@ FLOWBP_TRAINER_CHOICES = [
 ]
 
 SUPPORTED_INTERNAL_TRAINERS = {
+    "fullbp",
     "leapalign",
     "refl",
     "flowbp_lagrange",
