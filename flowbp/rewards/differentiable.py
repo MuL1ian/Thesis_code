@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 
 
 SUPPORTED_REWARD_MODELS = ("hpsv2", "mps", "hpsv3plusplus")
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+HPSV2_BACKBONE_FILENAMES = ("open_clip_pytorch_model.bin",)
+HPSV2_REWARD_FILENAMES = ("HPS_v2.1_compressed.pt", "HPS_v2_compressed.pt")
 
 
 def reward_model_type(args) -> str:
@@ -32,6 +39,130 @@ def normalize_prompts(prompts, batch_size: int) -> list[str]:
     if len(result) != batch_size:
         raise ValueError(f"Prompt batch mismatch: {len(result)} != {batch_size}")
     return result
+
+
+def reward_ckpt_search_dirs(args) -> list[str]:
+    """Ordered, de-duplicated list of directories to probe for reward weights."""
+    candidates: list[str] = []
+
+    def add(value) -> None:
+        if not value:
+            return
+        path = os.path.expanduser(str(value).strip())
+        if os.path.isfile(path):
+            path = os.path.dirname(path) or "."
+        if path and path not in candidates:
+            candidates.append(path)
+
+    add(getattr(args, "reward_ckpt_path", None))
+    add(getattr(args, "eval_reward_ckpt_path", None))
+    add(os.environ.get("FLOWBP_REWARD_CKPT_PATH", ""))
+    add(_REPO_ROOT / "models" / "reward_ckpts")
+    add(_REPO_ROOT / "reward_ckpts")
+    add("./hps_ckpt")
+    add(_REPO_ROOT / "hps_ckpt")
+    return candidates
+
+
+def _find_first(search_dirs: list[str], filenames: tuple[str, ...]) -> str | None:
+    for directory in search_dirs:
+        for filename in filenames:
+            path = os.path.join(directory, filename)
+            if os.path.isfile(path):
+                return path
+    return None
+
+
+def resolve_hpsv2_checkpoints(args) -> tuple[str, str]:
+    """Locate the OpenCLIP backbone and the HPSv2 reward checkpoint.
+
+    Each file is probed independently across the whole search path, so a
+    partially populated directory still resolves. Falls back to the downloading
+    resolver in ``flowbp.utils.hps_ckpt`` when nothing is present locally.
+    """
+    explicit_path = os.path.expanduser(
+        str(getattr(args, "reward_ckpt_path", "") or "").strip()
+    )
+    explicit_is_file = bool(explicit_path and os.path.isfile(explicit_path))
+    explicit_basename = os.path.basename(explicit_path)
+
+    search_dirs = reward_ckpt_search_dirs(args)
+    backbone_path = (
+        explicit_path
+        if explicit_is_file
+        and explicit_basename in HPSV2_BACKBONE_FILENAMES
+        else _find_first(search_dirs, HPSV2_BACKBONE_FILENAMES)
+    )
+    reward_path = (
+        explicit_path
+        if explicit_is_file
+        and explicit_basename not in HPSV2_BACKBONE_FILENAMES
+        else _find_first(search_dirs, HPSV2_REWARD_FILENAMES)
+    )
+    if backbone_path and reward_path:
+        return backbone_path, reward_path
+
+    from flowbp.utils.hps_ckpt import ensure_hpsv2_ckpts
+
+    return ensure_hpsv2_ckpts()
+
+
+def init_hpsv2_reward(args, device):
+    """Build the frozen HPSv2.1 reward model used as the training objective.
+
+    Returns ``(reward_model, tokenizer, preprocess_val)`` where
+    ``preprocess_val`` is the gradient-preserving image transform.
+    """
+    from hpsv2.src.open_clip import create_model_and_transforms, get_tokenizer
+
+    from flowbp.utils.hpsv2_transforms import HPSV2TransformsWithGrad
+
+    backbone_path, reward_path = resolve_hpsv2_checkpoints(args)
+
+    model, _, preprocess_val = create_model_and_transforms(
+        "ViT-H-14",
+        backbone_path,
+        precision="amp",
+        device=device,
+        jit=False,
+        force_quick_gelu=False,
+        force_custom_text=False,
+        force_patch_dropout=False,
+        force_image_size=None,
+        pretrained_image=False,
+        image_mean=None,
+        image_std=None,
+        light_augmentation=True,
+        aug_cfg={},
+        output_dict=True,
+        with_score_predictor=False,
+        with_region_predictor=False,
+    )
+    preprocess_val = HPSV2TransformsWithGrad(preprocess_val)
+
+    map_location = f"cuda:{device}" if isinstance(device, int) else device
+    checkpoint = torch.load(reward_path, map_location=map_location)
+    model.load_state_dict(checkpoint["state_dict"])
+    tokenizer = get_tokenizer("ViT-H-14")
+
+    reward_model = model.to(device)
+    reward_model.requires_grad_(False)
+    reward_model.eval()
+    return reward_model, tokenizer, preprocess_val
+
+
+def init_differentiable_reward(args, device):
+    """Build the training reward for ``args.reward_model_type``.
+
+    Returns ``(reward_model, processor, preprocess_val)``. MPS and HPSv3++ carry
+    their own preprocessing, so both trailing values are ``None`` for them.
+    """
+    selected = reward_model_type(args)
+    if selected == "hpsv2":
+        return init_hpsv2_reward(args, device)
+    if selected == "hpsv3plusplus":
+        return init_hpsv3plusplus_reward(args, device)
+    return init_mps_reward(args, device)
 
 
 def init_mps_reward(args, device):

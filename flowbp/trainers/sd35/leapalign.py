@@ -9,7 +9,6 @@ from copy import deepcopy
 import numpy as np
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 import wandb
 from accelerate.utils import set_seed
 from diffusers import AutoencoderKL, SD3Transformer2DModel
@@ -30,20 +29,33 @@ from flowbp.dataset.latent_sd35_rl_datasets import (
 from flowbp.eval.runners.online import run_online_sd35_eval
 from flowbp.rewards.differentiable import (
     compute_differentiable_reward,
-    init_hpsv3plusplus_reward,
-    init_mps_reward,
+    init_differentiable_reward,
     reward_loss_values,
     reward_model_type,
 )
 from flowbp.schedulers.fm_euler_discrete_with_pred_x0 import (
     FlowMatchEulerDiscreteWithPredX0Scheduler,
 )
+from flowbp.trainers.common.connector_logging import (
+    CONNECTOR_IMAGE_KEYS,
+    ENDPOINT_IMAGE_KEYS,
+    images_to_wandb_arrays,
+    maybe_log_connector_wandb,
+    maybe_save_connector_dump,
+)
 from flowbp.trainers.common.flowbp_lagrange_utils import (
     _jk_histogram_buffer,
     save_jk_sampling_csv,
 )
 from flowbp.trainers.common.jk_sampling import sample_jk_indices
-from flowbp.utils.checkpoint import save_checkpoint, save_peft_checkpoint
+from flowbp.utils.checkpoint import (
+    ema_checkpoint_dir,
+    load_transformer_weights,
+    resolve_resume_checkpoint,
+    resume_training_state,
+    save_checkpoint,
+    save_peft_checkpoint,
+)
 from flowbp.utils.debug_utils import setup_debug
 from flowbp.utils.ema_utils import save_sharded_ema_checkpoint
 from flowbp.utils.fsdp_util import apply_fsdp_checkpointing, get_dit_fsdp_kwargs
@@ -51,7 +63,6 @@ from flowbp.utils.gradlora_adapter import (
     GradLoRACalibrator,
     apply_gradlora_if_enabled,
 )
-from flowbp.utils.hpsv2_transforms import HPSV2TransformsWithGrad
 from flowbp.utils.logging_ import main_print
 from flowbp.utils.loraga_adapter import (
     LoRAGACalibrator,
@@ -284,48 +295,29 @@ def _maybe_decode_sd35_for_wandb(args, vae, latents, max_samples):
     if n <= 0:
         return []
     images = _decode_sd35_latents(args, vae, latents[:n].to(vae.device))
-    return [
-        image.detach().float().cpu().permute(1, 2, 0).numpy()
-        for image in images
-    ]
+    return images_to_wandb_arrays(images)
 
 
-def _maybe_log_connector_wandb(args, vae, prefix, payload):
-    interval = int(getattr(args, "connector_wandb_interval", getattr(args, "connector_dump_interval", 0)) or 0)
-    step = getattr(args, "current_train_step", None)
-    if interval <= 0 or step is None or int(step) % interval != 0:
-        return
-    if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
-        return
-    if payload is None or wandb.run is None:
-        return
-    max_samples = int(getattr(args, "connector_wandb_num_samples", 2) or 2)
-    log_payload = {}
-    for name in ("xj_pred", "xj", "x0_pred", "x0"):
-        images = _maybe_decode_sd35_for_wandb(args, vae, payload.get(name), max_samples)
-        if images:
-            log_payload[f"connector/{prefix}_{name}"] = [
-                wandb.Image(image, caption=f"{prefix} {name} sample {idx}")
-                for idx, image in enumerate(images)
-            ]
-    if log_payload:
-        wandb.log(log_payload, step=int(step))
+def _maybe_log_connector_wandb(
+    args,
+    vae,
+    prefix,
+    payload,
+    keys=CONNECTOR_IMAGE_KEYS,
+):
+    maybe_log_connector_wandb(
+        args,
+        prefix,
+        payload,
+        lambda latents, max_samples: _maybe_decode_sd35_for_wandb(
+            args, vae, latents, max_samples
+        ),
+        keys=keys,
+    )
 
 
 def _maybe_save_connector_dump(args, prefix, payload):
-    interval = int(getattr(args, "connector_dump_interval", 0) or 0)
-    step = getattr(args, "current_train_step", None)
-    if interval <= 0 or step is None or int(step) % interval != 0:
-        return
-    if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
-        return
-    dump_dir = getattr(args, "connector_dump_dir", None) or os.path.join(args.output_dir, "connector_dumps")
-    os.makedirs(dump_dir, exist_ok=True)
-    saved = {
-        key: value.detach().cpu() if torch.is_tensor(value) else value
-        for key, value in payload.items()
-    }
-    torch.save(saved, os.path.join(dump_dir, f"{prefix}_step_{int(step):06d}.pt"))
+    maybe_save_connector_dump(args, prefix, payload)
 
 
 def _optional_positive_float(value):
@@ -689,7 +681,13 @@ def train_sd35_one_step(
             negative_pooled_prompt_embeds,
             select_idx_generator,
         )
-        _maybe_log_connector_wandb(args, vae, "sd35_flowbp_sparse", getattr(args, "_last_connector_payload", None))
+        _maybe_log_connector_wandb(
+            args,
+            vae,
+            "sd35_flowbp_sparse",
+            getattr(args, "_last_connector_payload", None),
+            keys=ENDPOINT_IMAGE_KEYS,
+        )
     elif effective_trainer == "flowbp_bridge":
         latents_pred_x0, sample_weights, traj_metrics = sample_flowbp_bridge_trajectory_sd35(
             args,
@@ -807,41 +805,6 @@ def train_sd35_one_step(
     return avg_loss.item(), avg_reward_pred_x0.item(), grad_norm, reduced_traj_metrics
 
 
-def _init_hpsv2(args, device):
-    from hpsv2.src.open_clip import create_model_and_transforms, get_tokenizer
-    from flowbp.utils.hps_ckpt import ensure_hpsv2_ckpts
-
-    clip_path, hps_path = ensure_hpsv2_ckpts()
-    model, _, preprocess_val = create_model_and_transforms(
-        "ViT-H-14",
-        clip_path,
-        precision="amp",
-        device=device,
-        jit=False,
-        force_quick_gelu=False,
-        force_custom_text=False,
-        force_patch_dropout=False,
-        force_image_size=None,
-        pretrained_image=False,
-        image_mean=None,
-        image_std=None,
-        light_augmentation=True,
-        aug_cfg={},
-        output_dict=True,
-        with_score_predictor=False,
-        with_region_predictor=False,
-    )
-    preprocess_val = HPSV2TransformsWithGrad(preprocess_val)
-    checkpoint = torch.load(hps_path, map_location=f"cuda:{device}")
-    model.load_state_dict(checkpoint["state_dict"])
-    processor = get_tokenizer("ViT-H-14")
-    reward_model = model.to(device)
-    reward_model.requires_grad_(False)
-    reward_model.eval()
-    return reward_model, processor, preprocess_val
-
-
-
 def normalize_sd35_trainer_name(name: str | None) -> str:
     raw_name = str(name or "leapalign").lower().replace("-", "_")
     aliases = {
@@ -900,16 +863,25 @@ def run_training_sd35(args):
     if rank <= 0 and args.output_dir is not None:
         os.makedirs(args.output_dir, exist_ok=True)
 
-    selected_reward = reward_model_type(args)
-    if selected_reward == "mps":
-        reward_model, processor, preprocess_val = init_mps_reward(args, device)
-    elif selected_reward == "hpsv3plusplus":
-        reward_model, processor, preprocess_val = init_hpsv3plusplus_reward(
-            args, device
+    requested_adapters = any(
+        bool(getattr(args, name, False))
+        for name in ("use_lora", "use_gradlora", "use_loraga", "use_oft")
+    )
+    if getattr(args, "resume_from_checkpoint", None) and requested_adapters:
+        raise NotImplementedError(
+            "SD3.5 adapter checkpoints cannot currently be resumed. "
+            "Refusing to silently restart adapter training."
         )
-    else:
-        reward_model, processor, preprocess_val = _init_hpsv2(args, device)
+
+    selected_reward = reward_model_type(args)
+    reward_model, processor, preprocess_val = init_differentiable_reward(
+        args, device
+    )
     main_print(f"--> differentiable reward: {selected_reward}")
+
+    resume_ckpt_dir = resolve_resume_checkpoint(
+        getattr(args, "resume_from_checkpoint", None), args.output_dir
+    )
 
     main_print(f"--> loading SD3 model from {args.pretrained_model_name_or_path}")
     transformer = SD3Transformer2DModel.from_pretrained(
@@ -921,6 +893,10 @@ def run_training_sd35(args):
         args.pretrained_model_name_or_path,
         subfolder="scheduler",
     )
+
+    if resume_ckpt_dir is not None:
+        load_transformer_weights(transformer, resume_ckpt_dir)
+
     enabled_adapters = [
         name
         for name, enabled in (
@@ -966,6 +942,15 @@ def run_training_sd35(args):
         else None
     )
     ema_model = deepcopy(transformer) if args.use_ema else None
+    if ema_model is not None and resume_ckpt_dir is not None:
+        ema_dir = ema_checkpoint_dir(resume_ckpt_dir)
+        if ema_dir is not None:
+            load_transformer_weights(ema_model, ema_dir, label="EMA")
+        else:
+            main_print(
+                "--> no EMA checkpoint alongside the resume directory; "
+                "seeding EMA from the restored transformer weights"
+            )
     fsdp_kwargs, no_split_modules = get_dit_fsdp_kwargs(
         transformer,
         args.fsdp_sharding_startegy,
@@ -1009,7 +994,7 @@ def run_training_sd35(args):
             transformer,
             lr=args.learning_rate,
             betas=(0.9, 0.999),
-            eps=1e-8,
+            eps=float(args.adam_eps),
             weight_decay=0.0,
             damping=float(args.lora_pro_damping),
             rcond=args.lora_pro_rcond,
@@ -1023,7 +1008,7 @@ def run_training_sd35(args):
             lr=args.learning_rate,
             betas=(0.9, 0.999),
             weight_decay=args.weight_decay,
-            eps=1e-8,
+            eps=float(args.adam_eps),
             fused=False,
             foreach=False,
         )
@@ -1036,6 +1021,17 @@ def run_training_sd35(args):
         power=args.lr_power,
         last_epoch=-1,
     )
+
+    init_steps = 0
+    if resume_ckpt_dir is not None:
+        init_steps = resume_training_state(
+            transformer, optimizer, lr_scheduler, resume_ckpt_dir, rank
+        )
+        if init_steps >= args.max_train_steps:
+            main_print(
+                f"--> checkpoint step {init_steps} already reaches max_train_steps="
+                f"{args.max_train_steps}; nothing to do"
+            )
 
     train_dataset = LatentSD35Dataset(args.data_json_path, args.num_latent_t, args.cfg)
     sampler = DistributedSampler(train_dataset, rank=rank, num_replicas=world_size, shuffle=True, seed=args.sampler_seed)
@@ -1070,16 +1066,34 @@ def run_training_sd35(args):
             args.output_dir or ".",
             "loraga_calibration.json",
         )
+        use_second_moment = bool(
+            getattr(args, "loraga_use_second_moment", False)
+        )
+        second_moment_beta = float(
+            getattr(args, "loraga_second_moment_beta", 0.5)
+        )
+        if use_second_moment and not 0.0 < second_moment_beta <= 1.0:
+            raise ValueError(
+                "loraga_second_moment_beta must be in (0, 1] when "
+                f"loraga_use_second_moment is enabled, got {second_moment_beta}"
+            )
         main_print(
             f"***** LoRA-GA calibration: {calibration_batches} "
             f"reward-backprop batches (mode={calibration_mode}, "
             f"gamma={args.loraga_stable_gamma}, "
+            f"second_moment={use_second_moment}, "
+            f"beta={second_moment_beta if use_second_moment else 0.0}, "
             f"use_rslora={args.loraga_use_rslora}) *****"
         )
         calibrator = LoRAGACalibrator(
             transformer,
             accumulation_device=args.loraga_accumulation_device,
             offload_inputs=calibration_mode == "fullbp",
+            use_second_moment=use_second_moment,
+            second_moment_beta=second_moment_beta,
+            second_moment_rank=int(args.loraga_rank),
+            second_moment_oversample=int(args.loraga_svd_oversample),
+            moment_compute_device=args.loraga_svd_device,
         )
         optimizer.zero_grad(set_to_none=True)
         args.current_train_step = 0
@@ -1107,6 +1121,7 @@ def run_training_sd35(args):
                     fullbp_batch_size if calibration_mode == "fullbp" else None
                 ),
             )
+            calibrator.finish_batch()
             optimizer.zero_grad(set_to_none=True)
             main_print(
                 f"  LoRA-GA calibration batch "
@@ -1139,6 +1154,9 @@ def run_training_sd35(args):
                 ),
                 "stable_gamma": float(args.loraga_stable_gamma),
                 "use_rslora": bool(args.loraga_use_rslora),
+                "a_subspace": (
+                    "second_moment" if use_second_moment else "mean"
+                ),
             },
         )
         optimizer.zero_grad(set_to_none=True)
@@ -1430,9 +1448,14 @@ def run_training_sd35(args):
             wandb_tags = [str(tag).strip() for tag in wandb_tags if str(tag).strip()]
         else:
             wandb_tags = None
+        wandb_config = {
+            key: value
+            for key, value in vars(args).items()
+            if not key.startswith("_")
+        }
         wandb.init(
             project=args.project,
-            config=args,
+            config=wandb_config,
             name=args.run_name,
             tags=wandb_tags or None,
         )
@@ -1446,13 +1469,18 @@ def run_training_sd35(args):
     main_print(f"  Total optimization steps = {args.max_train_steps}")
     main_print(f"  Master weight dtype: {next(transformer.parameters()).dtype}")
 
-    progress_bar = tqdm(range(1, args.max_train_steps + 1), desc="Steps", disable=local_rank > 0)
+    progress_bar = tqdm(
+        range(1, args.max_train_steps + 1),
+        initial=init_steps,
+        desc="Steps",
+        disable=local_rank > 0,
+    )
     step_times = deque(maxlen=100)
 
     for epoch in range(1):
         if isinstance(sampler, DistributedSampler):
             sampler.set_epoch(epoch)
-        for step in range(1, args.max_train_steps + 1):
+        for step in range(init_steps + 1, args.max_train_steps + 1):
             args.current_train_step = step
             start_time = time.time()
             total_loss = 0.0
@@ -1492,7 +1520,18 @@ def run_training_sd35(args):
                         adapter_type=adapter_type,
                     )
                 else:
-                    save_checkpoint(transformer, rank, args.output_dir, step, epoch)
+                    save_checkpoint(
+                        transformer,
+                        rank,
+                        args.output_dir,
+                        step,
+                        epoch,
+                        optimizer=optimizer,
+                        lr_scheduler=lr_scheduler,
+                        save_optimizer_state=getattr(
+                            args, "save_optimizer_state", False
+                        ),
+                    )
                 if use_lora_pro and bool(args.lora_pro_save_optimizer_state):
                     _save_lorapro_optimizer_shard(
                         optimizer,

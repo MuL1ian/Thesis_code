@@ -30,22 +30,31 @@ from flowbp.dataset.latent_flux_rl_datasets import (
 )
 from flowbp.rewards.differentiable import (
     compute_differentiable_reward,
-    init_hpsv3plusplus_reward,
-    init_mps_reward,
+    init_differentiable_reward,
     reward_loss_values,
     reward_model_type,
 )
 from flowbp.schedulers.fm_euler_discrete_with_pred_x0 import (
     FlowMatchEulerDiscreteWithPredX0Scheduler,
 )
+from flowbp.trainers.common.connector_logging import (
+    images_to_wandb_arrays,
+    maybe_log_connector_wandb,
+    maybe_save_connector_dump,
+)
 from flowbp.trainers.common.jk_sampling import sample_jk_indices
-from flowbp.utils.checkpoint import save_checkpoint
+from flowbp.utils.checkpoint import (
+    ema_checkpoint_dir,
+    load_transformer_weights,
+    resolve_resume_checkpoint,
+    resume_training_state,
+    save_checkpoint,
+)
 from flowbp.utils.communications_flux import sp_parallel_dataloader_wrapper
 from flowbp.utils.debug_utils import setup_debug
 from flowbp.utils.ema_utils import save_sharded_ema_checkpoint
 from flowbp.eval.runners.online import run_online_flux_eval
 from flowbp.utils.fsdp_util import apply_fsdp_checkpointing, get_dit_fsdp_kwargs
-from flowbp.utils.hpsv2_transforms import HPSV2TransformsWithGrad
 from flowbp.utils.logging_ import main_print
 from flowbp.utils.parallel_states import (
     destroy_sequence_parallel_group,
@@ -92,25 +101,7 @@ def unpack_latents(latents, height, width, vae_scale_factor):
     return latents
 
 def _maybe_save_connector_dump(args, prefix: str, payload: dict) -> None:
-    interval = int(getattr(args, "connector_dump_interval", 0) or 0)
-    step = getattr(args, "current_train_step", None)
-    if interval <= 0 or step is None or int(step) % interval != 0:
-        return
-    if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
-        return
-
-    dump_dir = getattr(args, "connector_dump_dir", None)
-    if not dump_dir:
-        dump_dir = os.path.join(args.output_dir, "connector_dumps")
-    os.makedirs(dump_dir, exist_ok=True)
-
-    saved = {}
-    for key, value in payload.items():
-        if torch.is_tensor(value):
-            saved[key] = value.detach().cpu()
-        else:
-            saved[key] = value
-    torch.save(saved, os.path.join(dump_dir, f"{prefix}_step_{int(step):06d}.pt"))
+    maybe_save_connector_dump(args, prefix, payload)
 
 
 def _decode_packed_latents_for_wandb(args, vae, packed_latents, max_samples: int):
@@ -124,39 +115,18 @@ def _decode_packed_latents_for_wandb(args, vae, packed_latents, max_samples: int
         latents = (latents / 0.3611) + 0.1159
         images = vae.decode(latents, return_dict=False)[0]
         images = (images * 0.5 + 0.5).clamp(0, 1)
-    return [
-        image.detach().float().cpu().permute(1, 2, 0).numpy()
-        for image in images
-    ]
+    return images_to_wandb_arrays(images)
 
 
 def _maybe_log_connector_wandb(args, vae, prefix: str, payload: dict | None) -> None:
-    interval = int(getattr(args, "connector_wandb_interval", 0) or 0)
-    step = getattr(args, "current_train_step", None)
-    if interval <= 0 or step is None or int(step) % interval != 0:
-        return
-    if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
-        return
-    if payload is None or wandb.run is None:
-        return
-
-    max_samples = int(getattr(args, "connector_wandb_num_samples", 2) or 2)
-    log_payload = {}
-    for name in ("xj_pred", "xj", "x0_pred", "x0"):
-        images = _decode_packed_latents_for_wandb(
-            args,
-            vae,
-            payload.get(name),
-            max_samples,
-        )
-        if images:
-            log_payload[f"connector/{prefix}_{name}"] = [
-                wandb.Image(image, caption=f"{prefix} {name} sample {idx}")
-                for idx, image in enumerate(images)
-            ]
-
-    if log_payload:
-        wandb.log(log_payload, step=int(step))
+    maybe_log_connector_wandb(
+        args,
+        prefix,
+        payload,
+        lambda latents, max_samples: _decode_packed_latents_for_wandb(
+            args, vae, latents, max_samples
+        ),
+    )
 
 
 def sample_trajectory(
@@ -516,57 +486,16 @@ def run_training(args):
     if rank <= 0 and args.output_dir is not None:
         os.makedirs(args.output_dir, exist_ok=True)
 
+    resume_ckpt_dir = resolve_resume_checkpoint(
+        getattr(args, "resume_from_checkpoint", None), args.output_dir
+    )
+
     # For mixed precision training we cast all non-trainable weigths to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required
-    preprocess_val = None
     selected_reward = reward_model_type(args)
-    if selected_reward == "hpsv2":
-        from hpsv2.src.open_clip import create_model_and_transforms, get_tokenizer
-        from flowbp.utils.hps_ckpt import ensure_hpsv2_ckpts
-
-        clip_path, hps_path = ensure_hpsv2_ckpts()
-
-        def initialize_model():
-            model_dict = {}
-            model, preprocess_train, preprocess_val = create_model_and_transforms(
-                'ViT-H-14',
-                clip_path,
-                precision='amp',
-                device=device,
-                jit=False,
-                force_quick_gelu=False,
-                force_custom_text=False,
-                force_patch_dropout=False,
-                force_image_size=None,
-                pretrained_image=False,
-                image_mean=None,
-                image_std=None,
-                light_augmentation=True,
-                aug_cfg={},
-                output_dict=True,
-                with_score_predictor=False,
-                with_region_predictor=False
-            )
-            model_dict['model'] = model
-            model_dict['preprocess_val'] = preprocess_val
-            return model_dict
-        model_dict = initialize_model()
-        model = model_dict['model']
-        preprocess_val = model_dict['preprocess_val']
-        preprocess_val = HPSV2TransformsWithGrad(preprocess_val)
-
-        checkpoint = torch.load(hps_path, map_location=f'cuda:{device}')
-        model.load_state_dict(checkpoint['state_dict'])
-        processor = get_tokenizer('ViT-H-14')
-        reward_model = model.to(device)
-        reward_model.requires_grad_(False)
-        reward_model.eval()
-    elif selected_reward == "hpsv3plusplus":
-        reward_model, processor, preprocess_val = init_hpsv3plusplus_reward(
-            args, device
-        )
-    else:
-        reward_model, processor, preprocess_val = init_mps_reward(args, device)
+    reward_model, processor, preprocess_val = init_differentiable_reward(
+        args, device
+    )
     main_print(f"--> differentiable reward: {selected_reward}")
 
     main_print(f"--> loading model from {args.pretrained_model_name_or_path}")
@@ -587,9 +516,21 @@ def run_training(args):
             "Use flowbp.train_flowbp_sd35 for calibration-aware training."
         )
 
+    if resume_ckpt_dir is not None:
+        load_transformer_weights(transformer, resume_ckpt_dir)
+
     ema_model = None
     if args.use_ema:
         ema_model = deepcopy(transformer)
+        if resume_ckpt_dir is not None:
+            ema_dir = ema_checkpoint_dir(resume_ckpt_dir)
+            if ema_dir is not None:
+                load_transformer_weights(ema_model, ema_dir, label="EMA")
+            else:
+                main_print(
+                    "--> no EMA checkpoint alongside the resume directory; "
+                    "seeding EMA from the restored transformer weights"
+                )
 
     fsdp_kwargs, no_split_modules = get_dit_fsdp_kwargs(
         transformer,
@@ -638,7 +579,7 @@ def run_training(args):
         lr=args.learning_rate,
         betas=(0.9, 0.999),
         weight_decay=args.weight_decay,
-        eps=1e-8,
+        eps=float(args.adam_eps),
     )
 
     init_steps = 0
@@ -675,6 +616,15 @@ def run_training(args):
         select_idx_generator = None
 
     init_steps = 0
+    if resume_ckpt_dir is not None:
+        init_steps = resume_training_state(
+            transformer, optimizer, lr_scheduler, resume_ckpt_dir, rank
+        )
+        if init_steps >= args.max_train_steps:
+            main_print(
+                f"--> checkpoint step {init_steps} already reaches max_train_steps="
+                f"{args.max_train_steps}; nothing to do"
+            )
 
     #vae.enable_tiling()
 
@@ -707,10 +657,6 @@ def run_training(args):
     )
     # print dtype
     main_print(f"  Master weight dtype: {next(transformer.parameters()).dtype}")
-
-    # Potentially load in the weights and states from a previous save
-    if args.resume_from_checkpoint:
-        raise NotImplementedError("resume_from_checkpoint is not supported.")
 
     progress_bar = tqdm(
         range(1, args.max_train_steps+1),
@@ -812,8 +758,18 @@ def run_training(args):
                     tgt.data.lerp_(src.data.to(tgt), 1 - args.ema_decay)
             
             if step % args.checkpointing_steps == 0:
-                save_checkpoint(transformer, rank, args.output_dir,
-                                step, epoch)
+                save_checkpoint(
+                    transformer,
+                    rank,
+                    args.output_dir,
+                    step,
+                    epoch,
+                    optimizer=optimizer,
+                    lr_scheduler=lr_scheduler,
+                    save_optimizer_state=getattr(
+                        args, "save_optimizer_state", False
+                    ),
+                )
                 if args.use_ema:
                     save_sharded_ema_checkpoint(
                         ema_model, 

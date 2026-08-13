@@ -33,26 +33,27 @@ Default semantics:
 
 from __future__ import annotations
 
-import os
 
-import numpy as np
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
-import wandb
 
 from flowbp.rewards.differentiable import (
     compute_differentiable_reward,
     reward_loss_values,
 )
+from flowbp.trainers.common.connector_logging import (
+    ENDPOINT_IMAGE_KEYS,
+    maybe_log_connector_wandb,
+)
 from flowbp.trainers.common.rollout_window import resolve_train_step_window
 from flowbp.trainers.flux1.leapalign import (
     LeapAlignFluxTrainer,
+    _decode_packed_latents_for_wandb,
+    _maybe_save_connector_dump,
     run_training,
     unpack_latents,
 )
 from flowbp.trainers.flux1.flowbp_lagrange import (
-    _decode_packed_latents_for_wandb,
     _model_forward,
     _rollout_with_cache,
 )
@@ -109,54 +110,16 @@ def _scale_active_v_gradient(v: torch.Tensor, factor: float) -> torch.Tensor:
     return detached + float(factor) * (v - detached)
 
 
-def _maybe_save_connector_dump(args, prefix: str, payload: dict) -> None:
-    interval = int(getattr(args, "connector_dump_interval", 0) or 0)
-    step = getattr(args, "current_train_step", None)
-    if interval <= 0 or step is None or int(step) % interval != 0:
-        return
-    if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
-        return
-
-    dump_dir = getattr(args, "connector_dump_dir", None)
-    if not dump_dir:
-        dump_dir = os.path.join(args.output_dir, "connector_dumps")
-    os.makedirs(dump_dir, exist_ok=True)
-
-    saved = {}
-    for key, value in payload.items():
-        if torch.is_tensor(value):
-            saved[key] = value.detach().cpu()
-        else:
-            saved[key] = value
-    torch.save(saved, os.path.join(dump_dir, f"{prefix}_step_{int(step):06d}.pt"))
-
-
 def _maybe_log_connector_wandb(args, vae, prefix: str, payload: dict | None) -> None:
-    interval = int(getattr(args, "connector_wandb_interval", 0) or 0)
-    step = getattr(args, "current_train_step", None)
-    if interval <= 0 or step is None or int(step) % interval != 0:
-        return
-    if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
-        return
-    if payload is None or wandb.run is None:
-        return
-
-    max_samples = int(getattr(args, "connector_wandb_num_samples", 2) or 2)
-    log_payload = {}
-    for name in ("x0_pred", "x0_true"):
-        images = _decode_packed_latents_for_wandb(
-            args,
-            vae,
-            payload.get(name),
-            max_samples,
-        )
-        if images:
-            log_payload[f"connector/{prefix}_{name}"] = [
-                wandb.Image(image, caption=f"{prefix} {name} sample {idx}")
-                for idx, image in enumerate(images)
-            ]
-    if log_payload:
-        wandb.log(log_payload, step=int(step))
+    maybe_log_connector_wandb(
+        args,
+        prefix,
+        payload,
+        lambda latents, max_samples: _decode_packed_latents_for_wandb(
+            args, vae, latents, max_samples
+        ),
+        keys=ENDPOINT_IMAGE_KEYS,
+    )
 
 
 def _compose_x0_from_velocities(

@@ -27,16 +27,17 @@ Algorithm recap:
 
 from __future__ import annotations
 
-import os
 
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
-import wandb
 
 from flowbp.rewards.differentiable import (
     compute_differentiable_reward,
     reward_loss_values,
+)
+from flowbp.trainers.common.connector_logging import (
+    ENDPOINT_IMAGE_KEYS,
+    maybe_log_connector_wandb,
 )
 from flowbp.trainers.common.rollout_window import resolve_train_step_window
 from flowbp.trainers.flux1.flowbp_sparse import (
@@ -60,34 +61,19 @@ from flowbp.trainers.flux2.leapalign import (
 def _maybe_log_connector_wandb(args, vae, prefix: str, payload: dict | None) -> None:
     """FLUX.2 image-logging hook tailored to FlowBP-Sparse payload keys.
 
-    FlowBP-Sparse only produces ``x0_pred`` / ``x0_true`` (there is
-    no intermediate ``x_j`` like LeapAlign / FlowBP-Lagrange), so we only decode
-    those two tensors.
-    but routed through the FLUX.2 VAE de-BN + unpatchify path in
-    ``_decode_packed_latents_for_wandb``.
+    FlowBP-Sparse only produces ``x0_pred`` / ``x0_true`` (there is no
+    intermediate ``x_j`` like LeapAlign / FlowBP-Lagrange), routed through the
+    FLUX.2 VAE de-BN + unpatchify path in ``_decode_packed_latents_for_wandb``.
     """
-    interval = int(getattr(args, "connector_wandb_interval", 0) or 0)
-    step = getattr(args, "current_train_step", None)
-    if interval <= 0 or step is None or int(step) % interval != 0:
-        return
-    if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
-        return
-    if payload is None or wandb.run is None:
-        return
-
-    max_samples = int(getattr(args, "connector_wandb_num_samples", 2) or 2)
-    log_payload = {}
-    for name in ("x0_pred", "x0_true"):
-        images = _decode_packed_latents_for_wandb(
-            args, vae, payload.get(name), max_samples,
-        )
-        if images:
-            log_payload[f"connector/{prefix}_{name}"] = [
-                wandb.Image(image, caption=f"{prefix} {name} sample {idx}")
-                for idx, image in enumerate(images)
-            ]
-    if log_payload:
-        wandb.log(log_payload, step=int(step))
+    maybe_log_connector_wandb(
+        args,
+        prefix,
+        payload,
+        lambda latents, max_samples: _decode_packed_latents_for_wandb(
+            args, vae, latents, max_samples
+        ),
+        keys=ENDPOINT_IMAGE_KEYS,
+    )
 
 
 def sample_flowbp_sparse_trajectory(

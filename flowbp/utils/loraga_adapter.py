@@ -51,6 +51,11 @@ class LoRAGALayerDiagnostic:
     gamma: float
     initializer_scale: float
     use_rslora: bool
+    # Energy of the held-in gradient retained by A's rank-``r`` subspace alone.
+    # ``captured_energy`` covers the rank-``2r`` mean spectrum instead, so only
+    # this field is comparable between the mean and second-moment arms.
+    a_captured_energy: float = 0.0
+    second_moment_beta: float = 0.0
 
 
 def convert_loraga_to_portable_factors(
@@ -215,13 +220,19 @@ def apply_loraga_if_enabled(
 
 
 class LoRAGACalibrator(GradLoRACalibrator):
-    """Collect GradLoRA virtual gradients and finalize LoRA-GA factors."""
+    """Collect GradLoRA virtual gradients and finalize LoRA-GA factors.
+
+    With ``use_second_moment`` enabled, A is drawn from GradLoRA's shrinkage
+    mixture of the mean-gradient subspace and the per-batch gradient energy
+    instead of the plain mean-gradient SVD. B, the stable scaling, and the base
+    weight compensation are unchanged, so the two settings isolate the effect
+    of subspace selection under identical initialization dynamics.
+    """
 
     def __init__(self, model: nn.Module, **kwargs):
-        # LoRA-GA never computes second moments, so do not require CUDA merely
+        # Second moments are optional here, so do not require CUDA merely
         # because GradLoRACalibrator's generic default points there.
         kwargs.setdefault("moment_compute_device", "cpu")
-        kwargs["use_second_moment"] = False
         super().__init__(model, **kwargs)
 
     @torch.no_grad()
@@ -236,6 +247,11 @@ class LoRAGACalibrator(GradLoRACalibrator):
         metadata: dict[str, Any] | None = None,
     ) -> list[LoRAGALayerDiagnostic]:
         """Initialize LoRA-GA from globally averaged dense gradients."""
+        if self.use_second_moment and self.batch_gradients:
+            raise RuntimeError(
+                "LoRA-GA has an unfinished second-moment calibration batch; "
+                "call finish_batch() after every calibration backward pass"
+            )
         self.close()
         if rank <= 0:
             raise ValueError(f"LoRA-GA rank must be positive, got {rank}")
@@ -243,8 +259,11 @@ class LoRAGACalibrator(GradLoRACalibrator):
             raise ValueError(f"svd_device must be 'cpu' or 'cuda', got {svd_device}")
         if svd_device == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("CUDA SVD requested but CUDA is unavailable")
-        if self.use_second_moment:
-            raise ValueError("LoRA-GA uses the mean dense gradient, not second moments")
+        if self.use_second_moment and rank > self.second_moment_rank:
+            raise ValueError(
+                "LoRA-GA rank exceeds the configured second-moment sketch rank "
+                f"({rank} > {self.second_moment_rank})"
+            )
 
         distributed = dist.is_available() and dist.is_initialized()
         process_rank = dist.get_rank() if distributed else 0
@@ -262,19 +281,32 @@ class LoRAGACalibrator(GradLoRACalibrator):
             module = self.modules[name]
             rows = int(module.base_layer.out_features)
             cols = int(module.base_layer.in_features)
-            local_gradient = self.gradients.pop(
-                name,
-                torch.zeros(
-                    rows,
-                    cols,
-                    device=self.accumulation_device,
-                    dtype=torch.float32,
-                ),
-            )
-            gradient, total_calls = self._distributed_mean(
-                local_gradient,
-                self.calls.get(name, 0),
-            )
+            if self.use_second_moment:
+                (
+                    gradient,
+                    total_calls,
+                    moment_sketch,
+                    _,
+                    probe,
+                ) = self._pop_layer_state(name)
+            else:
+                # A structurally inactive layer never fires its gradient hook.
+                # Treat it as a zero gradient and fall back to standard LoRA.
+                local_gradient = self.gradients.pop(
+                    name,
+                    torch.zeros(
+                        rows,
+                        cols,
+                        device=self.accumulation_device,
+                        dtype=torch.float32,
+                    ),
+                )
+                gradient, total_calls = self._distributed_mean(
+                    local_gradient,
+                    self.calls.get(name, 0),
+                )
+                moment_sketch = None
+                probe = None
             if tuple(gradient.shape) != (rows, cols):
                 raise RuntimeError(
                     f"LoRA-GA gradient shape mismatch for {name}: "
@@ -288,6 +320,7 @@ class LoRAGACalibrator(GradLoRACalibrator):
             gradient_fro_sq = float(gradient.float().pow(2).sum().item())
             initialization = "gradient_svd"
             captured_energy = 0.0
+            a_captured_energy = 0.0
             sigma_max = 0.0
             sigma_min_kept = 0.0
             init_a: torch.Tensor | None = None
@@ -320,13 +353,31 @@ class LoRAGACalibrator(GradLoRACalibrator):
                 singular_values = singular_values[order]
                 left_vectors = left_vectors[:, order]
                 right_vectors = right_vectors[:, order]
+                a_basis = right_vectors[:, :rank]
+                if self.use_second_moment:
+                    eigensystem = self._mixed_right_eigensystem(
+                        matrix,
+                        probe,
+                        moment_sketch,
+                        rank,
+                    )
+                    if eigensystem is None:
+                        # Rank-0-only numerical failure. Keep the mean-gradient
+                        # subspace so every rank still receives one broadcast.
+                        initialization = "gradient_svd_second_moment_fallback"
+                    else:
+                        a_basis = eigensystem[0]
+                        initialization = "gradient_second_moment"
                 init_a = (
-                    initializer_scale
-                    * right_vectors[:, :rank].transpose(0, 1).contiguous()
+                    initializer_scale * a_basis.transpose(0, 1).contiguous()
                 )
                 init_b = (
                     initializer_scale
                     * left_vectors[:, rank:decomposition_rank].contiguous()
+                )
+                a_captured_energy = float(
+                    (matrix @ a_basis).pow(2).sum().item()
+                    / max(gradient_fro_sq, 1e-24)
                 )
                 captured_energy = float(
                     singular_values[:decomposition_rank].pow(2).sum().item()
@@ -374,6 +425,12 @@ class LoRAGACalibrator(GradLoRACalibrator):
                         gamma=gamma,
                         initializer_scale=initializer_scale,
                         use_rslora=use_rslora,
+                        a_captured_energy=a_captured_energy,
+                        second_moment_beta=(
+                            self.second_moment_beta
+                            if self.use_second_moment
+                            else 0.0
+                        ),
                     )
                 )
             del gradient
@@ -435,6 +492,10 @@ class LoRAGACalibrator(GradLoRACalibrator):
                 "rank": rank,
                 "oversample": oversample,
                 "power_iterations": niter,
+                "use_second_moment": self.use_second_moment,
+                "second_moment_beta": (
+                    self.second_moment_beta if self.use_second_moment else 0.0
+                ),
                 "layers": [asdict(item) for item in diagnostics],
             }
             if metadata:
@@ -449,7 +510,19 @@ class LoRAGACalibrator(GradLoRACalibrator):
                 f"{len(fallback_layers)} layer(s): "
                 + ", ".join(fallback_layers)
             )
+        median_a_energy = float("nan")
+        aligned = [
+            item
+            for item in diagnostics
+            if item.initialization.startswith("gradient_")
+        ]
+        if aligned:
+            energies = sorted(item.a_captured_energy for item in aligned)
+            median_a_energy = energies[len(energies) // 2]
         main_print(
-            f"--> LoRA-GA initialized {len(initializers)}/{len(self.modules)} layers"
+            f"--> LoRA-GA initialized {len(initializers)}/{len(self.modules)} "
+            f"layers (A subspace="
+            f"{'second_moment' if self.use_second_moment else 'mean'}, "
+            f"median A captured energy={median_a_energy:.4f})"
         )
         return diagnostics

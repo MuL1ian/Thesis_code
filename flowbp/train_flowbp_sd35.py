@@ -1,3 +1,5 @@
+"""FlowBP SD3.5 fine-tuning entrypoint."""
+
 from __future__ import annotations
 
 import argparse
@@ -8,27 +10,18 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from flowbp.config.flowbp import load_config_defaults
-from flowbp.train_flowbp_flux import build_parser
+from flowbp.config.parser import build_parser as _build_parser
+from flowbp.config.parser import parse_args as _parse_args
+
+BACKEND = "sd35"
 
 
-def normalize_sd35_trainer_name(name: str | None) -> str:
-    raw_name = str(name or "leapalign").lower().replace("-", "_")
-    aliases = {
-        "flowbp_sparse": "flowbp_sparse",
-        "flowbp_bridge": "flowbp_bridge",
-        "flowbp_lagrange": "flowbp_lagrange",
-    }
-    return aliases.get(raw_name, raw_name)
+def build_parser() -> argparse.ArgumentParser:
+    return _build_parser(BACKEND)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = build_parser()
-    parser.description = "FlowBP SD3.5 fine-tuning entrypoint."
-    probe_args, _ = parser.parse_known_args()
-    if probe_args.config:
-        parser.set_defaults(**load_config_defaults(probe_args.config))
-    return parser.parse_args()
+    return _parse_args(BACKEND)
 
 
 def main() -> None:
@@ -56,14 +49,13 @@ def main() -> None:
         "draft_lv": LeapAlignDRaFTLVSD35Trainer,
         "drtune": LeapAlignDRTuneSD35Trainer,
     }
-    trainer_name = normalize_sd35_trainer_name(args.trainer)
-    if trainer_name not in trainer_map:
+    if args.trainer not in trainer_map:
         raise ValueError(
             "SD3.5 entrypoint supports fullbp/flowbp_sparse/flowbp_bridge/"
             "flowbp_lagrange and baselines leapalign/refl/draft_lv/drtune, "
             f"got {args.trainer!r}."
         )
-    trainer_map[trainer_name](args).train()
+    trainer_map[args.trainer](args).train()
 
 
 if __name__ == "__main__":

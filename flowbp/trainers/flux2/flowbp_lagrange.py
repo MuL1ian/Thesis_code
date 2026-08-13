@@ -8,25 +8,28 @@ Lagrange weights, gradient rescaling, anchor-lambda blending) is identical.
 
 from __future__ import annotations
 
-import os
 
 import numpy as np
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
-import wandb
 
 from flowbp.rewards.differentiable import (
     compute_differentiable_reward,
     reward_loss_values,
 )
 from flowbp.trainers.common.jk_sampling import sample_jk_indices
+from flowbp.trainers.common.flowbp_lagrange_utils import (
+    _lagrange_quadrature_predict,
+    _scale_nonstart_gradient_forward_value,
+    _select_active_support_indices,
+    _select_interval_support_indices,
+)
 from flowbp.trainers.flux2.leapalign import (
     FLUX2_PATCH_CHANNELS,
     FLUX2_TOTAL_DOWNSAMPLE,
     LeapAlignFlux2Trainer,
     _cfg_aware_forward,
-    _decode_packed_latents_for_wandb,
+    _maybe_log_connector_wandb,
     _maybe_save_connector_dump,
     compute_empirical_mu,
     decode_packed_latents,
@@ -59,82 +62,6 @@ def _model_forward(
         text_ids,
         image_ids,
     )
-
-
-def _select_interval_support_indices(
-    start_idx: int,
-    target_idx: int,
-    num_velocities: int,
-    order: int = 4,
-) -> list[int]:
-    assert start_idx < target_idx, (start_idx, target_idx)
-    assert 0 <= start_idx < num_velocities
-
-    order = max(1, int(order))
-    last_idx = min(target_idx - 1, num_velocities - 1)
-    interval = list(range(start_idx, last_idx + 1))
-    if len(interval) <= order:
-        return interval
-
-    positions = torch.linspace(0, len(interval) - 1, steps=order).round().long().tolist()
-    support = [interval[p] for p in positions]
-    support[0] = start_idx
-
-    dedup: list[int] = []
-    for idx in support:
-        if idx not in dedup:
-            dedup.append(idx)
-    return dedup
-
-
-def _select_active_support_indices(
-    support_indices: list[int],
-    start_idx: int,
-    mode: str = "start",
-    max_active: int | None = None,
-) -> list[int]:
-    mode = str(mode).lower()
-    if start_idx not in support_indices and mode != "none":
-        raise ValueError(
-            f"start_idx={start_idx} must be present in support_indices={support_indices}"
-        )
-
-    if mode == "none":
-        selected: list[int] = []
-    elif mode == "start":
-        selected = [start_idx]
-    elif mode == "midpoint":
-        if len(support_indices) <= 1:
-            selected = [start_idx]
-        else:
-            selected = support_indices[:2]
-    elif mode == "all":
-        selected = list(support_indices)
-    else:
-        raise ValueError(
-            "Invalid flowbp_lagrange_grad_support_mode="
-            f"{mode!r}; expected one of 'none', 'start', 'midpoint', or 'all'."
-        )
-
-    selected_set = set(selected)
-    ordered = [idx for idx in support_indices if idx in selected_set]
-    if max_active is not None:
-        max_active = int(max_active)
-    if max_active is not None and max_active > 0:
-        ordered = ordered[:max_active]
-    return ordered
-
-
-def _scale_nonstart_gradient_forward_value(
-    tensor: torch.Tensor,
-    scale: float,
-) -> torch.Tensor:
-    if scale == 1:
-        return tensor
-    if scale == 0:
-        return tensor.detach()
-    detached = tensor.detach()
-    return detached + float(scale) * (tensor - detached)
 
 
 def _build_active_support_velocities(
@@ -194,190 +121,6 @@ def _build_active_support_velocities(
             v_i, grad_scale,
         )
     return active_velocities, active_indices
-
-
-def _lagrange_integral_weights(
-    sigma_points: torch.Tensor,
-    sigma_start: torch.Tensor,
-    sigma_target: torch.Tensor,
-    device,
-    dtype,
-) -> torch.Tensor:
-    points64 = sigma_points.detach().to(device=device, dtype=torch.float64)
-    start64 = torch.as_tensor(sigma_start, device=device, dtype=torch.float64)
-    target64 = torch.as_tensor(sigma_target, device=device, dtype=torch.float64)
-
-    weights = []
-    for i in range(points64.numel()):
-        coeff = torch.ones(1, device=device, dtype=torch.float64)
-        denom = torch.ones((), device=device, dtype=torch.float64)
-        for j in range(points64.numel()):
-            if j == i:
-                continue
-            new_coeff = torch.zeros(
-                coeff.numel() + 1, device=device, dtype=torch.float64,
-            )
-            new_coeff[:-1] += -points64[j] * coeff
-            new_coeff[1:] += coeff
-            coeff = new_coeff
-            denom = denom * (points64[i] - points64[j])
-
-        coeff = coeff / denom
-        integral = torch.zeros((), device=device, dtype=torch.float64)
-        for power, c in enumerate(coeff):
-            integral = integral + c / float(power + 1) * (
-                target64 ** (power + 1) - start64 ** (power + 1)
-            )
-        weights.append(integral)
-
-    return torch.stack(weights).to(device=device, dtype=dtype)
-
-
-def _uniform_integral_weights(
-    num_points: int,
-    sigma_start: torch.Tensor,
-    sigma_target: torch.Tensor,
-    device,
-    dtype,
-) -> torch.Tensor:
-    if num_points <= 0:
-        raise ValueError(f"num_points must be positive, got {num_points}")
-    start = torch.as_tensor(sigma_start, device=device, dtype=torch.float64)
-    target = torch.as_tensor(sigma_target, device=device, dtype=torch.float64)
-    weight = (target - start) / float(num_points)
-    return torch.full((num_points,), weight.item(), device=device, dtype=dtype)
-
-
-def _maybe_log_connector_wandb(args, vae, prefix: str, payload: dict | None) -> None:
-    interval = int(getattr(args, "connector_wandb_interval", 0) or 0)
-    step = getattr(args, "current_train_step", None)
-    if interval <= 0 or step is None or int(step) % interval != 0:
-        return
-    if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
-        return
-    if payload is None or wandb.run is None:
-        return
-
-    max_samples = int(getattr(args, "connector_wandb_num_samples", 2) or 2)
-    log_payload = {}
-    for name in ("xj_pred", "xj", "x0_pred", "x0"):
-        images = _decode_packed_latents_for_wandb(
-            args, vae, payload.get(name), max_samples,
-        )
-        if images:
-            log_payload[f"connector/{prefix}_{name}"] = [
-                wandb.Image(image, caption=f"{prefix} {name} sample {idx}")
-                for idx, image in enumerate(images)
-            ]
-    if log_payload:
-        wandb.log(log_payload, step=int(step))
-
-
-def _lagrange_quadrature_predict(
-    x_start,
-    current_v,
-    cached_velocities,
-    sigmas,
-    start_idx,
-    target_idx,
-    order=4,
-    detach_history=True,
-    support_indices=None,
-    active_velocities=None,
-    grad_rescale=0.0,
-    weight_scheme="lagrange",
-):
-    assert target_idx > start_idx, (start_idx, target_idx)
-    assert len(sigmas) == len(cached_velocities) + 1
-    assert 0 <= start_idx < len(cached_velocities)
-    assert 0 < target_idx < len(sigmas)
-
-    device = x_start.device
-    dtype = torch.float32
-    if support_indices is None:
-        support_indices = _select_interval_support_indices(
-            start_idx=start_idx,
-            target_idx=target_idx,
-            num_velocities=len(cached_velocities),
-            order=order,
-        )
-    else:
-        support_indices = list(support_indices)
-    assert target_idx not in support_indices, (target_idx, support_indices)
-    assert all(0 <= idx < len(cached_velocities) for idx in support_indices)
-
-    use_legacy_start_gradient = active_velocities is None
-    if active_velocities is None:
-        active_velocities = {}
-    active_support_indices = [
-        idx for idx in support_indices if idx in active_velocities
-    ]
-    sigma_points = sigmas[support_indices].to(device=device, dtype=torch.float64)
-    sigma_start = sigmas[start_idx].to(device=device, dtype=torch.float64)
-    sigma_target = sigmas[target_idx].to(device=device, dtype=torch.float64)
-    weight_scheme = str(weight_scheme).lower()
-    if weight_scheme == "lagrange":
-        weights = _lagrange_integral_weights(
-            sigma_points=sigma_points,
-            sigma_start=sigma_start,
-            sigma_target=sigma_target,
-            device=device,
-            dtype=dtype,
-        )
-    elif weight_scheme == "uniform":
-        weights = _uniform_integral_weights(
-            num_points=len(support_indices),
-            sigma_start=sigma_start,
-            sigma_target=sigma_target,
-            device=device,
-            dtype=dtype,
-        )
-    else:
-        raise ValueError(
-            f"Invalid flowbp_lagrange_weight_scheme={weight_scheme!r}; "
-            "expected 'lagrange' or 'uniform'."
-        )
-
-    grad_rescale_factor = 1.0
-    if grad_rescale > 0 and active_support_indices:
-        total_abs_weight = weights.abs().sum()
-        idx_to_pos = {idx: pos for pos, idx in enumerate(support_indices)}
-        active_abs_weight = sum(
-            weights[idx_to_pos[idx]].abs() for idx in active_support_indices
-        )
-        if active_abs_weight > 1e-8:
-            full_factor = (total_abs_weight / active_abs_weight).item()
-            grad_rescale_factor = 1.0 + grad_rescale * (full_factor - 1.0)
-
-    delta = torch.zeros_like(x_start, dtype=torch.float32)
-    for weight, idx in zip(weights, support_indices):
-        if idx in active_velocities:
-            velocity = active_velocities[idx]
-            if grad_rescale_factor != 1.0:
-                v_detached = velocity.detach()
-                velocity = v_detached + grad_rescale_factor * (velocity - v_detached)
-        elif idx == start_idx and use_legacy_start_gradient:
-            velocity = current_v
-            if grad_rescale_factor != 1.0:
-                v_detached = velocity.detach()
-                velocity = v_detached + grad_rescale_factor * (velocity - v_detached)
-        else:
-            velocity = cached_velocities[idx]
-            if detach_history:
-                velocity = velocity.detach()
-        delta = delta + weight * velocity.float()
-
-    info = {
-        "support_indices": support_indices,
-        "active_support_indices": active_support_indices,
-        "weights": weights.detach(),
-        "start_weight": weights[0].detach(),
-        "weight_abs_sum": weights.abs().sum().detach(),
-        "grad_rescale_factor": torch.tensor(
-            grad_rescale_factor, device=device, dtype=torch.float32
-        ),
-    }
-    return x_start.float() + delta, info
 
 
 def _sample_initial_latents_flux2(args, device, batch_size):

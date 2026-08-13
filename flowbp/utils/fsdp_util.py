@@ -41,6 +41,30 @@ non_reentrant_wrapper = partial(
     checkpoint_impl=CheckpointImpl.NO_REENTRANT,
 )
 
+def _declared_no_split_modules(transformer):
+    """Resolve ``model._no_split_modules`` class names to the actual classes.
+
+    Diffusers transformers declare their FSDP-wrappable block types by name.
+    Resolving them off the instantiated model keeps new backbones working
+    without another hardcoded branch here.
+    """
+    names = list(getattr(transformer, "_no_split_modules", None) or [])
+    if not names:
+        return ()
+    found = {}
+    for module in transformer.modules():
+        cls = type(module)
+        if cls.__name__ in names and cls.__name__ not in found:
+            found[cls.__name__] = cls
+    missing = [name for name in names if name not in found]
+    if missing:
+        raise ValueError(
+            f"{type(transformer).__name__} declares _no_split_modules={names}, "
+            f"but these classes were not found in the instantiated model: {missing}"
+        )
+    return tuple(found[name] for name in names)
+
+
 def get_no_split_modules(transformer):
     peft_base_model = getattr(transformer, "base_model", None)
     if peft_base_model is not None:
@@ -51,7 +75,14 @@ def get_no_split_modules(transformer):
         return (Flux2TransformerBlock, Flux2SingleTransformerBlock)
     if _SD3_AVAILABLE and isinstance(transformer, SD3Transformer2DModel):
         return (JointTransformerBlock,)
-    raise ValueError(f"Unsupported transformer type: {type(transformer)}")
+
+    declared = _declared_no_split_modules(transformer)
+    if declared:
+        return declared
+    raise ValueError(
+        f"Unsupported transformer type: {type(transformer)}. It declares no "
+        "_no_split_modules, so FSDP has no block boundary to shard on."
+    )
 
 
 def apply_fsdp_checkpointing(model, no_split_modules, p=1):

@@ -1,12 +1,17 @@
 import copy
+from contextlib import contextmanager
 import json
 import math
 import os
+import re
+import shutil
+import tempfile
 
 import torch
+import torch.distributed as dist
 import torch.distributed.checkpoint as dist_cp
 from peft import get_peft_model_state_dict
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 from torch.distributed.checkpoint.default_planner import DefaultSavePlanner
 from torch.distributed.fsdp import (FullOptimStateDictConfig,
                                     FullStateDictConfig)
@@ -14,6 +19,41 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import StateDictType
 
 from flowbp.utils.logging_ import main_print
+
+WEIGHT_FILENAME = "diffusion_pytorch_model.safetensors"
+TRAINING_STATE_FILENAME = "training_state.pt"
+OPTIMIZER_FILENAME = "optimizer.pt"
+_CHECKPOINT_DIR_RE = re.compile(r"^checkpoint-(\d+)-(\d+)$")
+
+
+@contextmanager
+def atomic_output_dir(final_dir):
+    """Build a checkpoint beside its final path, then publish it atomically."""
+    final_dir = os.path.abspath(os.fspath(final_dir))
+    parent = os.path.dirname(final_dir)
+    os.makedirs(parent, exist_ok=True)
+    if os.path.exists(final_dir):
+        raise FileExistsError(f"Refusing to overwrite checkpoint: {final_dir}")
+
+    temp_dir = tempfile.mkdtemp(
+        prefix=f".{os.path.basename(final_dir)}.tmp-",
+        dir=parent,
+    )
+    try:
+        yield temp_dir
+        os.rename(temp_dir, final_dir)
+    except BaseException:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
+
+
+def sync_rank0_save_error(rank, error_message, context):
+    """Make every rank fail together when rank 0 cannot publish a checkpoint."""
+    payload = [error_message if rank <= 0 else None]
+    if dist.is_available() and dist.is_initialized():
+        dist.broadcast_object_list(payload, src=0)
+    if payload[0] is not None:
+        raise RuntimeError(f"{context} failed on rank 0: {payload[0]}")
 
 
 def _state_key_ending_with(state_dict, suffix):
@@ -216,7 +256,23 @@ def save_checkpoint_optimizer(model,
     main_print(f"--> checkpoint saved at step {step}")
 
 
-def save_checkpoint(transformer, rank, output_dir, step, epoch, mean_grad_norm=None):
+def save_checkpoint(transformer,
+                    rank,
+                    output_dir,
+                    step,
+                    epoch,
+                    mean_grad_norm=None,
+                    optimizer=None,
+                    lr_scheduler=None,
+                    save_optimizer_state=False):
+    """Save transformer weights, plus the state needed by `--resume_from_checkpoint`.
+
+    ``optimizer`` is only serialized when ``save_optimizer_state`` is set,
+    because a full AdamW state is roughly twice the parameter footprint.
+    Without it a resumed run restores weights, step counter and LR schedule but
+    restarts the AdamW moments from zero. Data-loader and RNG state are not
+    checkpointed, so even optimizer-state resume is not bitwise reproducible.
+    """
     main_print(f"--> saving checkpoint at step {step}")
     with FSDP.state_dict_type(
             transformer,
@@ -224,21 +280,213 @@ def save_checkpoint(transformer, rank, output_dir, step, epoch, mean_grad_norm=N
             FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
     ):
         cpu_state = transformer.state_dict()
+
+    # FSDP.optim_state_dict is a collective, so every rank has to enter it even
+    # though only rank 0 ends up holding the gathered state.
+    optim_state = None
+    if save_optimizer_state and optimizer is not None:
+        with FSDP.state_dict_type(
+                transformer,
+                StateDictType.FULL_STATE_DICT,
+                FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
+                FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True),
+        ):
+            optim_state = FSDP.optim_state_dict(transformer, optimizer)
+
+    save_error = None
     if rank <= 0:
-        save_dir = os.path.join(output_dir, f"checkpoint-{step}-{epoch}")
-        os.makedirs(save_dir, exist_ok=True)
-        weight_path = os.path.join(save_dir,
-                                   "diffusion_pytorch_model.safetensors")
-        save_file(cpu_state, weight_path)
-        config_dict = _config_to_dict(transformer)
-        config_path = os.path.join(save_dir, "config.json")
-        with open(config_path, "w") as f:
-            json.dump(config_dict, f, indent=4)
-        
-        if mean_grad_norm is not None:
-            with open(os.path.join(save_dir, 'mean_grad_norm.json'), 'w') as f:
-                json.dump({'mean_grad_norm': mean_grad_norm}, f, indent=4)
+        try:
+            final_dir = os.path.join(output_dir, f"checkpoint-{step}-{epoch}")
+            with atomic_output_dir(final_dir) as save_dir:
+                weight_path = os.path.join(save_dir, WEIGHT_FILENAME)
+                save_file(cpu_state, weight_path)
+                config_dict = _config_to_dict(transformer)
+                config_path = os.path.join(save_dir, "config.json")
+                with open(config_path, "w") as f:
+                    json.dump(config_dict, f, indent=4)
+
+                if mean_grad_norm is not None:
+                    with open(
+                        os.path.join(save_dir, "mean_grad_norm.json"),
+                        "w",
+                    ) as f:
+                        json.dump({"mean_grad_norm": mean_grad_norm}, f, indent=4)
+
+                training_state = {
+                    "step": int(step),
+                    "epoch": int(epoch),
+                    "lr_scheduler": (
+                        lr_scheduler.state_dict()
+                        if lr_scheduler is not None
+                        else None
+                    ),
+                    "has_optimizer_state": optim_state is not None,
+                }
+                torch.save(
+                    training_state,
+                    os.path.join(save_dir, TRAINING_STATE_FILENAME),
+                )
+
+                if optim_state is not None:
+                    torch.save(
+                        optim_state,
+                        os.path.join(save_dir, OPTIMIZER_FILENAME),
+                    )
+        except Exception as exc:
+            save_error = f"{type(exc).__name__}: {exc}"
+    sync_rank0_save_error(rank, save_error, "Transformer checkpoint save")
     main_print(f"--> checkpoint saved at step {step}")
+
+
+def find_latest_checkpoint(output_dir):
+    """Return the `checkpoint-{step}-{epoch}` dir with the highest step, if any."""
+    if not output_dir or not os.path.isdir(output_dir):
+        return None
+    latest = None
+    for name in os.listdir(output_dir):
+        match = _CHECKPOINT_DIR_RE.match(name)
+        if match is None:
+            continue
+        candidate = os.path.join(output_dir, name)
+        if not os.path.isfile(os.path.join(candidate, WEIGHT_FILENAME)):
+            continue
+        step = int(match.group(1))
+        if latest is None or step > latest[0]:
+            latest = (step, candidate)
+    return latest[1] if latest is not None else None
+
+
+def resolve_resume_checkpoint(resume_from_checkpoint, output_dir):
+    """Turn a `--resume_from_checkpoint` value into a concrete directory."""
+    if not resume_from_checkpoint:
+        return None
+    if str(resume_from_checkpoint).strip().lower() == "latest":
+        latest = find_latest_checkpoint(output_dir)
+        if latest is None:
+            main_print(
+                "--> resume_from_checkpoint='latest' but no checkpoint was found "
+                f"under {output_dir}; starting from scratch"
+            )
+        return latest
+    path = os.path.expanduser(str(resume_from_checkpoint))
+    if not os.path.isdir(path):
+        raise FileNotFoundError(
+            f"resume_from_checkpoint directory not found: {path}"
+        )
+    if not os.path.isfile(os.path.join(path, WEIGHT_FILENAME)):
+        raise FileNotFoundError(
+            f"{path} does not contain {WEIGHT_FILENAME}; it is not a FlowBP checkpoint"
+        )
+    return path
+
+
+def read_training_state(ckpt_dir):
+    """Read the small resume metadata, falling back to the directory name."""
+    state_path = os.path.join(ckpt_dir, TRAINING_STATE_FILENAME)
+    if os.path.isfile(state_path):
+        return torch.load(state_path, map_location="cpu", weights_only=False)
+
+    match = _CHECKPOINT_DIR_RE.match(os.path.basename(os.path.normpath(ckpt_dir)))
+    step = int(match.group(1)) if match else 0
+    epoch = int(match.group(2)) if match else 0
+    main_print(
+        f"--> {TRAINING_STATE_FILENAME} missing in {ckpt_dir}; "
+        f"inferring step={step} from the directory name and resetting the LR schedule"
+    )
+    return {
+        "step": step,
+        "epoch": epoch,
+        "lr_scheduler": None,
+        "has_optimizer_state": False,
+    }
+
+
+def ema_checkpoint_dir(ckpt_dir):
+    """Map `.../checkpoint-{s}-{e}` to its sibling `.../checkpoint-ema-{s}-{e}`."""
+    normalized = os.path.normpath(ckpt_dir)
+    base = os.path.basename(normalized)
+    if not _CHECKPOINT_DIR_RE.match(base):
+        return None
+    ema_dir = os.path.join(
+        os.path.dirname(normalized),
+        base.replace("checkpoint-", "checkpoint-ema-", 1),
+    )
+    return ema_dir if os.path.isdir(ema_dir) else None
+
+
+def load_transformer_weights(model, ckpt_dir, label="transformer"):
+    """Load FULL_STATE_DICT weights into a plain module.
+
+    Must be called before FSDP wrapping: the saved keys have no FSDP prefix and
+    every rank already holds the unsharded module at that point, so this adds no
+    peak memory over the initial `from_pretrained`.
+    """
+    weight_path = os.path.join(ckpt_dir, WEIGHT_FILENAME)
+    if not os.path.isfile(weight_path):
+        raise FileNotFoundError(f"{weight_path} not found")
+    state_dict = load_file(weight_path)
+    model.load_state_dict(state_dict)
+    main_print(f"--> restored {label} weights from {weight_path}")
+    return model
+
+
+def load_optimizer_state(transformer, optimizer, ckpt_dir, rank):
+    """Reshard a saved full optimizer state back onto this FSDP process group.
+
+    Returns True when state was restored. Only rank 0 reads the file; FSDP
+    scatters the shards to the other ranks.
+    """
+    optim_path = os.path.join(ckpt_dir, OPTIMIZER_FILENAME)
+    if not os.path.isfile(optim_path):
+        return False
+    with FSDP.state_dict_type(
+            transformer,
+            StateDictType.FULL_STATE_DICT,
+            FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
+            FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True),
+    ):
+        full_state = (
+            torch.load(optim_path, map_location="cpu", weights_only=False)
+            if rank <= 0
+            else {}
+        )
+        sharded_state = FSDP.optim_state_dict_to_load(
+            model=transformer,
+            optim=optimizer,
+            optim_state_dict=full_state,
+        )
+    optimizer.load_state_dict(sharded_state)
+    main_print(f"--> restored optimizer state from {optim_path}")
+    return True
+
+
+def resume_training_state(transformer, optimizer, lr_scheduler, ckpt_dir, rank):
+    """Restore optimizer/LR state after FSDP wrapping and return the resume step.
+
+    Transformer and EMA weights are restored separately, before FSDP wrapping,
+    via `load_transformer_weights`.
+    """
+    state = read_training_state(ckpt_dir)
+    init_steps = int(state.get("step", 0))
+
+    if not load_optimizer_state(transformer, optimizer, ckpt_dir, rank):
+        main_print(
+            f"--> no {OPTIMIZER_FILENAME} in {ckpt_dir}; AdamW moments restart "
+            "from zero (use --save_optimizer_state to restore optimizer moments)"
+        )
+
+    lr_state = state.get("lr_scheduler")
+    if lr_state is not None and lr_scheduler is not None:
+        lr_scheduler.load_state_dict(lr_state)
+        main_print("--> restored LR scheduler state")
+    elif lr_scheduler is not None and init_steps > 0:
+        # Replay the schedule so the LR matches the step we are resuming at.
+        for _ in range(init_steps):
+            lr_scheduler.step()
+        main_print(f"--> fast-forwarded LR scheduler by {init_steps} steps")
+
+    main_print(f"--> resuming from {ckpt_dir} at step {init_steps}")
+    return init_steps
 
 
 def save_peft_checkpoint(
@@ -258,32 +506,48 @@ def save_peft_checkpoint(
     ):
         full_state_dict = transformer.state_dict()
 
+    save_error = None
     if rank <= 0:
-        save_dir = os.path.join(
-            output_dir, f"{adapter_type}-checkpoint-{step}-{epoch}"
-        )
-        os.makedirs(save_dir, exist_ok=True)
-        if adapter_type == "loraga":
-            _save_portable_loraga_checkpoint(
-                peft_model,
-                full_state_dict,
-                save_dir,
-                step,
-                epoch,
+        try:
+            final_dir = os.path.join(
+                output_dir, f"{adapter_type}-checkpoint-{step}-{epoch}"
             )
-        else:
-            peft_model.save_pretrained(
-                save_dir,
-                state_dict=full_state_dict,
-                safe_serialization=True,
-                is_main_process=True,
-            )
-            with open(os.path.join(save_dir, "training_state.json"), "w") as f:
-                json.dump(
-                    {"step": step, "epoch": epoch, "adapter_type": adapter_type},
-                    f,
-                    indent=4,
-                )
+            with atomic_output_dir(final_dir) as save_dir:
+                if adapter_type == "loraga":
+                    _save_portable_loraga_checkpoint(
+                        peft_model,
+                        full_state_dict,
+                        save_dir,
+                        step,
+                        epoch,
+                    )
+                else:
+                    peft_model.save_pretrained(
+                        save_dir,
+                        state_dict=full_state_dict,
+                        safe_serialization=True,
+                        is_main_process=True,
+                    )
+                    with open(
+                        os.path.join(save_dir, "training_state.json"),
+                        "w",
+                    ) as f:
+                        json.dump(
+                            {
+                                "step": step,
+                                "epoch": epoch,
+                                "adapter_type": adapter_type,
+                            },
+                            f,
+                            indent=4,
+                        )
+        except Exception as exc:
+            save_error = f"{type(exc).__name__}: {exc}"
+    sync_rank0_save_error(
+        rank,
+        save_error,
+        f"{adapter_type.upper()} checkpoint save",
+    )
     main_print(f"--> {adapter_type.upper()} checkpoint saved at step {step}")
 
 

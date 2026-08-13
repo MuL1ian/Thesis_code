@@ -598,6 +598,104 @@ class GradLoRACalibrator:
         return vectors[:, :rank], eigenvalues[:rank]
 
     @torch.no_grad()
+    def _pop_layer_state(
+        self,
+        name: str,
+    ) -> tuple[torch.Tensor, int, torch.Tensor | None, float, torch.Tensor | None]:
+        """Consume one layer's calibration buffers as globally averaged state.
+
+        Returns the mean dense gradient and its total hook-call count, plus --
+        only when second-moment mixing is enabled -- the averaged gradient
+        energy sketch, its trace, and the layer's random probe.
+        """
+        if name not in self.gradients or self.calls.get(name, 0) == 0:
+            raise RuntimeError(
+                f"GradLoRA collected no gradient for {name}. "
+                "Check that calibration performed a differentiable backward pass."
+            )
+        if not self.use_second_moment:
+            gradient, total_calls = self._distributed_mean(
+                self.gradients.pop(name),
+                self.calls[name],
+            )
+            return gradient, total_calls, None, 0.0, None
+
+        local_batches = self.batch_counts.get(name, 0)
+        if (
+            local_batches == 0
+            or name not in self.second_moment_sketches
+            or name not in self.second_moment_probes
+        ):
+            raise RuntimeError(
+                f"GradLoRA collected no completed second-moment batch for {name}"
+            )
+        gradient, total_batches = self._distributed_mean(
+            self.gradients.pop(name),
+            local_batches,
+        )
+        moment_sketch, sketch_batches = self._distributed_mean(
+            self.second_moment_sketches.pop(name),
+            local_batches,
+        )
+        moment_trace_tensor, trace_batches = self._distributed_mean(
+            torch.tensor(
+                self.second_moment_traces[name],
+                dtype=torch.float32,
+                device=self.accumulation_device,
+            ),
+            local_batches,
+        )
+        if not (total_batches == sketch_batches == trace_batches):
+            raise RuntimeError(
+                f"GradLoRA second-moment batch-count mismatch for {name}"
+            )
+        distributed = dist.is_available() and dist.is_initialized()
+        count_device = (
+            torch.device("cuda", torch.cuda.current_device())
+            if distributed and dist.get_backend() == "nccl"
+            else gradient.device
+        )
+        total_calls = self._distributed_total_count(
+            self.calls[name],
+            count_device,
+        )
+        return (
+            gradient,
+            total_calls,
+            moment_sketch,
+            float(moment_trace_tensor.item()),
+            self.second_moment_probes.pop(name),
+        )
+
+    @torch.no_grad()
+    def _mixed_right_eigensystem(
+        self,
+        matrix: torch.Tensor,
+        probe: torch.Tensor,
+        moment_sketch: torch.Tensor,
+        layer_rank: int,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Nystrom eigensystem of the shrinkage-mixed gradient second moment.
+
+        Mixes ``G^T G`` of the mean gradient with the per-batch energy
+        ``E[G_i^T G_i]`` and returns orthonormal right vectors as columns
+        together with a singular-value-scaled spectrum, or ``None`` when the
+        sketch is numerically rank-deficient.
+        """
+        probe_matrix = probe.to(matrix.device, dtype=torch.float32)
+        mean_sketch = matrix.transpose(0, 1) @ (matrix @ probe_matrix)
+        mixed_sketch = (
+            (1.0 - self.second_moment_beta) * mean_sketch
+            + self.second_moment_beta
+            * moment_sketch.to(matrix.device, dtype=torch.float32)
+        )
+        eigensystem = self._nystrom_eigh(probe_matrix, mixed_sketch, layer_rank)
+        if eigensystem is None:
+            return None
+        right_vectors, eigenvalues = eigensystem
+        return right_vectors, eigenvalues.clamp_min(0).sqrt()
+
+    @torch.no_grad()
     def finalize(
         self,
         *,
@@ -663,63 +761,13 @@ class GradLoRACalibrator:
         diagnostics: list[GradLoRALayerDiagnostic] = []
         zero_gradient_layers: list[str] = []
         for name in sorted(self.modules):
-            if name not in self.gradients or self.calls.get(name, 0) == 0:
-                raise RuntimeError(
-                    f"GradLoRA collected no gradient for {name}. "
-                    "Check that calibration performed a differentiable backward pass."
-                )
-            if self.use_second_moment:
-                local_batches = self.batch_counts.get(name, 0)
-                if (
-                    local_batches == 0
-                    or name not in self.second_moment_sketches
-                    or name not in self.second_moment_probes
-                ):
-                    raise RuntimeError(
-                        f"GradLoRA collected no completed second-moment batch "
-                        f"for {name}"
-                    )
-                gradient, total_batches = self._distributed_mean(
-                    self.gradients.pop(name),
-                    local_batches,
-                )
-                moment_sketch, sketch_batches = self._distributed_mean(
-                    self.second_moment_sketches.pop(name),
-                    local_batches,
-                )
-                moment_trace_tensor, trace_batches = self._distributed_mean(
-                    torch.tensor(
-                        self.second_moment_traces[name],
-                        dtype=torch.float32,
-                        device=self.accumulation_device,
-                    ),
-                    local_batches,
-                )
-                if not (
-                    total_batches == sketch_batches == trace_batches
-                ):
-                    raise RuntimeError(
-                        f"GradLoRA second-moment batch-count mismatch for {name}"
-                    )
-                count_device = (
-                    torch.device("cuda", torch.cuda.current_device())
-                    if distributed and dist.get_backend() == "nccl"
-                    else gradient.device
-                )
-                total_calls = self._distributed_total_count(
-                    self.calls[name],
-                    count_device,
-                )
-                moment_trace = float(moment_trace_tensor.item())
-                probe = self.second_moment_probes.pop(name)
-            else:
-                gradient, total_calls = self._distributed_mean(
-                    self.gradients.pop(name),
-                    self.calls[name],
-                )
-                moment_sketch = None
-                moment_trace = 0.0
-                probe = None
+            (
+                gradient,
+                total_calls,
+                moment_sketch,
+                moment_trace,
+                probe,
+            ) = self._pop_layer_state(name)
             rows, cols = gradient.shape
             layer_rank = min(rank, rows, cols)
             q = min(layer_rank + max(int(oversample), 0), rows, cols)
@@ -772,21 +820,10 @@ class GradLoRACalibrator:
                     zero_gradient_layers.append(name)
                 else:
                     if self.use_second_moment:
-                        probe_matrix = probe.to(
-                            factor_device,
-                            dtype=torch.float32,
-                        )
-                        mean_sketch = matrix.transpose(0, 1) @ (
-                            matrix @ probe_matrix
-                        )
-                        mixed_sketch = (
-                            (1.0 - self.second_moment_beta) * mean_sketch
-                            + self.second_moment_beta
-                            * moment_sketch.to(factor_device, dtype=torch.float32)
-                        )
-                        eigensystem = self._nystrom_eigh(
-                            probe_matrix,
-                            mixed_sketch,
+                        eigensystem = self._mixed_right_eigensystem(
+                            matrix,
+                            probe,
+                            moment_sketch,
                             layer_rank,
                         )
                         if eigensystem is None:
@@ -816,19 +853,18 @@ class GradLoRACalibrator:
                                 singular_values[layer_rank - 1].item()
                             )
                         else:
-                            right_vectors, eigenvalues = eigensystem
+                            right_vectors, initializer_spectrum = eigensystem
                             init_a = right_vectors.transpose(0, 1).contiguous()
-                            initializer_spectrum = eigenvalues.clamp_min(0).sqrt()
                             kept_energy = float(
                                 min(
-                                    eigenvalues.sum().item()
+                                    initializer_spectrum.pow(2).sum().item()
                                     / max(objective_energy, 1e-24),
                                     1.0,
                                 )
                             )
-                            sigma_max = float(eigenvalues[0].sqrt().item())
+                            sigma_max = float(initializer_spectrum[0].item())
                             sigma_min_kept = float(
-                                eigenvalues[layer_rank - 1].sqrt().item()
+                                initializer_spectrum[layer_rank - 1].item()
                             )
                     else:
                         _, singular_values, right_vectors = torch.svd_lowrank(

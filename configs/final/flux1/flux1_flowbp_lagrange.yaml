@@ -43,10 +43,7 @@ flowbp:
   select_idx_seed: 114
   min_idx: 1
   max_idx: 26
-  jk_sampling_mode: dirichlet
-  jk_dirichlet_alpha_a: 2.5
-  jk_dirichlet_alpha_b: 6.0
-  jk_dirichlet_alpha_c: 2.0
+  jk_sampling_mode: uniform
 flowbp_lagrange:
   alpha: 0.1
   tau: 0.2

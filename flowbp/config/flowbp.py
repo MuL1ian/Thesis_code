@@ -63,10 +63,12 @@ _SECTION_KEY_MAP: dict[str, dict[str, str]] = {
         "connector_wandb_interval": "connector_wandb_interval",
         "connector_wandb_num_samples": "connector_wandb_num_samples",
         "resume_from_checkpoint": "resume_from_checkpoint",
+        "save_optimizer_state": "save_optimizer_state",
     },
     "optimizer": {
         "learning_rate": "learning_rate",
         "weight_decay": "weight_decay",
+        "adam_eps": "adam_eps",
         "lr_scheduler": "lr_scheduler",
         "lr_warmup_steps": "lr_warmup_steps",
         "lr_num_cycles": "lr_num_cycles",
@@ -91,6 +93,8 @@ _SECTION_KEY_MAP: dict[str, dict[str, str]] = {
         "dropout": "loraga_dropout",
         "use_rslora": "loraga_use_rslora",
         "stable_gamma": "loraga_stable_gamma",
+        "use_second_moment": "loraga_use_second_moment",
+        "second_moment_beta": "loraga_second_moment_beta",
         "calibration_batches": "loraga_calibration_batches",
         "calibration_mode": "loraga_calibration_mode",
         "fullbp_batch_size": "loraga_fullbp_batch_size",
@@ -147,6 +151,7 @@ _SECTION_KEY_MAP: dict[str, dict[str, str]] = {
     "distributed": {
         "sp_size": "sp_size",
         "fsdp_sharding_startegy": "fsdp_sharding_startegy",
+        "fsdp_sharding_strategy": "fsdp_sharding_startegy",
         "selective_checkpointing": "selective_checkpointing",
         "use_cpu_offload": "use_cpu_offload",
     },
@@ -183,11 +188,6 @@ _SECTION_KEY_MAP: dict[str, dict[str, str]] = {
         "tau": "tau",
         # j-k index sampling shared by FlowBP-Bridge/Lagrange
         "jk_sampling_mode": "jk_sampling_mode",
-        "jk_dirichlet_alpha": "jk_dirichlet_alpha",
-        "jk_dirichlet_alpha_a": "jk_dirichlet_alpha_a",
-        "jk_dirichlet_alpha_b": "jk_dirichlet_alpha_b",
-        "jk_dirichlet_alpha_c": "jk_dirichlet_alpha_c",
-        "jk_dirichlet_max_j_rev": "jk_dirichlet_max_j_rev",
     },
     "refl": {
         "last_n_steps": "refl_last_n_steps",
