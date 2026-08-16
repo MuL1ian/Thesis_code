@@ -138,6 +138,16 @@ _SECTION_KEY_MAP: dict[str, dict[str, str]] = {
         "usefulness_batches": "gradlora_usefulness_batches",
         "diagnostics_path": "gradlora_diagnostics_path",
     },
+    "rq3": {
+        "enabled": "use_rq3_probe",
+        "use_rq3_probe": "use_rq3_probe",
+        "heldout_batches": "gradlora_usefulness_batches",
+        "report_path": "rq3_report_path",
+        "score_device": "rq3_score_device",
+        "batch_oracle_ratio": "rq3_batch_oracle_ratio",
+        "layer_sample": "rq3_layer_sample",
+        "max_retained_gib": "rq3_max_retained_gib",
+    },
     "oft": {
         "enabled": "use_oft",
         "use_oft": "use_oft",
@@ -174,6 +184,8 @@ _SECTION_KEY_MAP: dict[str, dict[str, str]] = {
         "mps_mask_threshold": "mps_mask_threshold",
         "loss_type": "reward_loss_type",
         "reward_loss_type": "reward_loss_type",
+        "input_mode": "reward_input_mode",
+        "reward_input_mode": "reward_input_mode",
         "loss_grad_scale": "loss_grad_scale",
         "loss_relu_clip": "loss_relu_clip",
         "hpsv3plusplus_iter_start": "hpsv3plusplus_iter_start",
@@ -358,13 +370,87 @@ def build_default_run_name(config_path: str | Path | None, config_data: dict[str
     return f"{model_name}_{method_name}_{reward_name}_bs{batch_size}"
 
 
-def _load_yaml(path: str | Path) -> dict[str, Any]:
-    config_path = Path(path)
+BASE_KEY = "_base_"
+REPLACE_KEY = "_replace_"
+
+
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """Recursively overlay ``override`` on ``base``.
+
+    Mappings merge key by key so a child config can change one field of a
+    section without restating the rest. Every other value, lists included,
+    replaces the inherited one outright: a child that lists ``logging.tags``
+    means those tags, not those plus the parent's.
+
+    Merging is the wrong default for a mapping that enumerates a set rather
+    than naming fields -- ``eval.reward_fn`` is the case in this repo, where a
+    child that wants one metric would otherwise silently inherit five. Set
+    ``_replace_: true`` inside such a mapping to drop the inherited one.
+    """
+
+    merged = dict(base)
+    for key, value in override.items():
+        inherited = merged.get(key)
+        if isinstance(value, dict) and value.get(REPLACE_KEY):
+            merged[key] = {
+                inner_key: inner_value
+                for inner_key, inner_value in value.items()
+                if inner_key != REPLACE_KEY
+            }
+        elif isinstance(inherited, dict) and isinstance(value, dict):
+            merged[key] = _deep_merge(inherited, value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _load_yaml(
+    path: str | Path,
+    _chain: tuple[Path, ...] = (),
+) -> dict[str, Any]:
+    """Load one config, resolving ``_base_`` inheritance depth-first.
+
+    ``_base_`` takes a path or list of paths relative to the config that
+    declares it, so a directory of configs can share one base file and pick up
+    later edits to it without being regenerated. Later entries in the list win
+    over earlier ones, and the config's own keys win over all of them.
+    """
+
+    config_path = Path(path).resolve()
+    if config_path in _chain:
+        cycle = " -> ".join(str(item) for item in (*_chain, config_path))
+        raise ValueError(f"FlowBP config {BASE_KEY} cycle: {cycle}")
     with config_path.open("r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
     if not isinstance(data, dict):
         raise ValueError(f"FlowBP config must be a mapping, got {type(data).__name__}")
-    return data
+
+    base_spec = data.pop(BASE_KEY, None)
+    if base_spec is None:
+        return data
+    if isinstance(base_spec, (str, Path)):
+        base_spec = [base_spec]
+    if not isinstance(base_spec, list):
+        raise ValueError(
+            f"Config key {BASE_KEY!r} must be a path or list of paths, "
+            f"got {type(base_spec).__name__}"
+        )
+
+    merged: dict[str, Any] = {}
+    for entry in base_spec:
+        base_path = Path(str(entry))
+        if not base_path.is_absolute():
+            base_path = config_path.parent / base_path
+        if not base_path.is_file():
+            raise FileNotFoundError(
+                f"{config_path} declares {BASE_KEY} {entry!r}, which resolves "
+                f"to a missing file: {base_path}"
+            )
+        merged = _deep_merge(
+            merged,
+            _load_yaml(base_path, (*_chain, config_path)),
+        )
+    return _deep_merge(merged, data)
 
 
 def _flatten_section(section_name: str, section: dict[str, Any], defaults: dict[str, Any]) -> None:

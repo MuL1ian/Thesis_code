@@ -36,6 +36,78 @@ from flowbp.utils.peft_adapter import (
 GRADLORA_A_SCALE_MODES = ("legacy", "relative", "gain")
 
 
+def _json_safe(value: Any) -> Any:
+    """Replace non-finite floats with ``None`` so the payload is valid JSON."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+def write_json_report(path: str, payload: Any, **dump_kwargs: Any) -> None:
+    """Write a diagnostics report as strictly valid JSON.
+
+    ``json.dump`` emits bare ``NaN`` by default, which is not JSON and is
+    rejected by strict parsers -- including the analysis tools these reports
+    exist to feed. Undefined diagnostics are genuinely null, so they are
+    written that way and ``allow_nan=False`` keeps any survivor loud.
+    """
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(_json_safe(payload), handle, allow_nan=False, **dump_kwargs)
+
+
+@torch.no_grad()
+def trainable_parameter_digest(model: nn.Module) -> str:
+    """SHA-256 over the raw bytes of every trainable parameter on this rank.
+
+    Bytes rather than norms: the probe is only sound if it leaves the model
+    exactly as calibration left it, and a summary statistic can miss updates
+    that cancel. Under ``use_orig_params=True`` each rank digests its own
+    shard, which is sufficient because any real update would touch some shard.
+    """
+    digest = hashlib.sha256()
+    for name, parameter in sorted(model.named_parameters()):
+        if not parameter.requires_grad:
+            continue
+        digest.update(name.encode("utf-8"))
+        # reshape(-1) first: a dtype view needs a contiguous last dimension,
+        # and this also covers scalar parameters, which cannot be viewed.
+        tensor = parameter.detach().to("cpu").contiguous().reshape(-1)
+        digest.update(tensor.view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
+
+
+@torch.no_grad()
+def assert_lora_b_is_zero(model: nn.Module, *, context: str) -> None:
+    """Fail loudly if any LoRA B is non-zero.
+
+    B == 0 is what makes the adapter an exact identity, so the held-out probe
+    measures the base model's gradients rather than gradients already bent by a
+    partially trained adapter. A non-zero B silently invalidates every held-out
+    number rather than producing an obvious error, so it is checked instead of
+    assumed.
+    """
+    offenders = [
+        name
+        for name, parameter in model.named_parameters()
+        if ".lora_B." in name and bool(parameter.detach().any().item())
+    ]
+    if offenders:
+        raise RuntimeError(
+            f"GradLoRA {context}: LoRA B is non-zero on "
+            f"{len(offenders)} parameters (e.g. {offenders[0]}); the adapter "
+            "is no longer an identity and held-out scores are invalid"
+        )
+
+# tr(Sigma) = (snr - 1) * ||Gbar||_F^2, so it collapses to zero exactly when the
+# per-batch gradients agree. Below this fraction of ||Gbar||_F^2 the covariance
+# term is numerical noise and the criterion falls back to beta = 0.
+SIGMA_TRACE_TOL = 1e-6
+
+
 @dataclass
 class GradLoRALayerDiagnostic:
     name: str
@@ -51,6 +123,25 @@ class GradLoRALayerDiagnostic:
     a_row_norm_scale: float
     a_scale_mode: str = "legacy"
     write_gain: float = 0.0
+    # tr(M) / ||Gbar||_F^2, at least 1 by Cauchy-Schwarz and read against
+    # K_cal rather than bounded by it: 1 means the per-batch gradients agree,
+    # about K_cal means independent zero-mean noise, and above K_cal means they
+    # partly cancel, which is worse than noise. It says how far apart the two
+    # endpoints of the mixed criterion can be and predicts the calibration
+    # budget at which the selection stabilises.
+    gradient_snr: float = float("nan")
+    # sum(sigma_i) / (sqrt(r) * ||sigma||_2) in [r^-0.5, 1]. One means a flat
+    # retained spectrum (worst case for the Nystrom sketch), r^-0.5 means a
+    # single direction carries everything.
+    spectral_flatness: float = float("nan")
+    # Cosine between Adam's first B update and the ideal low-rank direction,
+    # computed from the actual initializer rather than predicted from a
+    # spectrum. B starts at zero, so the first B gradient is exactly Gbar A^T
+    # and Adam's first step is its elementwise sign; this is therefore
+    # ||M||_1 / (sqrt(numel) * ||M||_2) with M = Gbar A^T. It sits near
+    # sqrt(2/pi) ~ 0.798 for a Gaussian-shaped M, which is the value a measured
+    # first-update cosine has to be read against -- not one.
+    predicted_adam_cosine: float = float("nan")
 
 
 def _adapter_scaling(module: nn.Module, adapter: str) -> float:
@@ -111,6 +202,50 @@ def _resolve_a_row_scale(
             f"({row_scale}) in {mode!r} mode"
         )
     return row_scale, scaling * row_scale
+
+
+def _first_step_adam_cosine(
+    mean_gradient: torch.Tensor,
+    init_a: torch.Tensor | None,
+) -> float:
+    """Cosine between Adam's first ``B`` update and the ideal direction.
+
+    ``B`` starts at zero, so the first gradient w.r.t. ``B`` is exactly
+    ``M = Gbar A^T`` and Adam's first step is its elementwise sign (the
+    per-parameter second moment equals the square of the first). The cosine
+    between ``sign(M)`` and ``M`` is then ``||M||_1 / (sqrt(numel) ||M||_2)``.
+
+    Measured from the initializer that will actually be written, not inferred
+    from the criterion's spectrum: under second-moment mixing the eigenvectors
+    of ``C_beta`` do not diagonalise ``Gbar^T Gbar``, so that spectrum carries
+    no information about the shape of ``M``. Cheap because ``M`` is only
+    ``d_out x r``.
+    """
+    if init_a is None:
+        return float("nan")
+    update = mean_gradient.to(init_a.device, dtype=torch.float32) @ (
+        init_a.to(dtype=torch.float32).transpose(0, 1)
+    )
+    l2 = float(update.pow(2).sum().sqrt().item())
+    if not math.isfinite(l2) or l2 <= 0.0:
+        return float("nan")
+    l1 = float(update.abs().sum().item())
+    return l1 / (math.sqrt(update.numel()) * l2)
+
+
+def _spectral_flatness(spectrum: torch.Tensor | None) -> float:
+    """``sum(sigma_i) / (sqrt(r) * ||sigma||_2)`` over the retained spectrum.
+
+    Ranges over ``[r**-0.5, 1]``: one when the retained directions carry equal
+    weight, ``r**-0.5`` when a single direction carries everything.
+    """
+    if spectrum is None or spectrum.numel() == 0:
+        return float("nan")
+    values = spectrum.detach().float().abs()
+    l2 = float(values.pow(2).sum().sqrt().item())
+    if not math.isfinite(l2) or l2 <= 0.0:
+        return float("nan")
+    return float(values.sum().item()) / (math.sqrt(values.numel()) * l2)
 
 
 def _apply_spectral_exponent(
@@ -367,6 +502,24 @@ class GradLoRACalibrator:
         self.probe_reference_energy: dict[str, dict[str, float]] = {}
         self.probe_layer_stats: dict[str, dict[str, dict[str, float]]] = {}
         self.probe_batch_records: dict[str, list[dict[str, float]]] = {}
+        # Mean calibration gradient per layer, kept only for probing. RQ3 needs
+        # it to give the oracle arm a reference direction on the same footing
+        # as every other arm. A full dense copy of every target layer, so it is
+        # opt-in and normally requested on the scoring rank alone.
+        self.keep_calibration_gradients = False
+        self.probe_calibration_gradients: dict[str, torch.Tensor] = {}
+        # Reducing per-layer gradients across ranks is a collective, so every
+        # rank must agree on whether it happens. The observer that consumes the
+        # result, in contrast, is normally attached on one rank only: it
+        # retains every held-out batch until the oracle is known, and holding
+        # that on all ranks would multiply the memory by the world size.
+        self.probe_reduce_gradients = False
+        # Optional callback receiving (batch_index, data-parallel-mean layer
+        # gradients) once per held-out batch. Scoring that needs the full
+        # per-layer gradient, rather than the running scalars accumulated here,
+        # attaches through this rather than by extending this class.
+        self.probe_observer: Any = None
+        self._probe_batch_index = 0
         self._register_hooks()
 
     def _register_hooks(self, phase: str = "calibration") -> None:
@@ -479,19 +632,35 @@ class GradLoRACalibrator:
             return
         if not self.batch_gradients:
             # ReLU clip / inactive rewards can produce a zero graph with no
-            # hooked layer gradients. Skip that batch instead of aborting.
+            # hooked layer gradients. Other ranks may still have some, and the
+            # reduction below is collective, so this rank contributes zeros
+            # rather than returning.
             main_print(
                 "[warning] GradLoRA second-moment batch captured no layer "
-                "gradients; skipping this calibration batch"
+                "gradients on this rank; contributing zeros to this "
+                "calibration batch"
             )
-            return
 
-        for name, batch_gradient in self.batch_gradients.items():
+        # Sigma describes the spread between *global* batches, so the batch
+        # gradient must be reduced across ranks before it is squared. Squaring
+        # each rank's shard instead would measure the spread between shards --
+        # a batch W times smaller, hence W times noisier -- which inflates snr,
+        # biases the beta mixture toward the covariance term, and redefines the
+        # batch away from the unit the held-out probe scores in.
+        batch_gradients = self._reduced_batch_gradients()
+
+        for name in sorted(self.modules):
+            # Counted even when absent, because a global batch that produced no
+            # gradient for this layer is a genuine zero observation of it, not
+            # a missing one.
+            self.batch_counts[name] += 1
+            batch_gradient = batch_gradients.get(name)
+            if batch_gradient is None:
+                continue
             if name not in self.gradients:
                 self.gradients[name] = batch_gradient.clone()
             else:
                 self.gradients[name].add_(batch_gradient)
-            self.batch_counts[name] += 1
 
             compute_gradient = batch_gradient.to(
                 self.moment_compute_device,
@@ -597,6 +766,18 @@ class GradLoRACalibrator:
             eigenvalues = torch.cat((eigenvalues, padding))
         return vectors[:, :rank], eigenvalues[:rank]
 
+    def _layer_shape(self, name: str) -> tuple[int, int]:
+        base_layer = self.modules[name].base_layer
+        return int(base_layer.out_features), int(base_layer.in_features)
+
+    def _zero_gradient(self, name: str) -> torch.Tensor:
+        """A zero stand-in so an inactive layer can still join the reductions."""
+        return torch.zeros(
+            self._layer_shape(name),
+            dtype=torch.float32,
+            device=self.accumulation_device,
+        )
+
     @torch.no_grad()
     def _pop_layer_state(
         self,
@@ -607,39 +788,51 @@ class GradLoRACalibrator:
         Returns the mean dense gradient and its total hook-call count, plus --
         only when second-moment mixing is enabled -- the averaged gradient
         energy sketch, its trace, and the layer's random probe.
+
+        A layer that produced nothing on *this* rank contributes zeros and
+        still takes part in every reduction. Raising instead would abort one
+        rank while the others block forever in the collectives below, and it
+        would also pre-empt the ``standard_lora_fallback`` that a globally
+        inactive layer is supposed to reach -- the caller decides that, after
+        the reduction, from the global gradient.
         """
-        if name not in self.gradients or self.calls.get(name, 0) == 0:
-            raise RuntimeError(
-                f"GradLoRA collected no gradient for {name}. "
-                "Check that calibration performed a differentiable backward pass."
-            )
+        local_gradient = self.gradients.pop(name, None)
+        if local_gradient is None:
+            local_gradient = self._zero_gradient(name)
+
         if not self.use_second_moment:
             gradient, total_calls = self._distributed_mean(
-                self.gradients.pop(name),
-                self.calls[name],
+                local_gradient,
+                self.calls.get(name, 0),
             )
             return gradient, total_calls, None, 0.0, None
 
         local_batches = self.batch_counts.get(name, 0)
-        if (
-            local_batches == 0
-            or name not in self.second_moment_sketches
-            or name not in self.second_moment_probes
-        ):
-            raise RuntimeError(
-                f"GradLoRA collected no completed second-moment batch for {name}"
+        probe = self._second_moment_probe(name, self._layer_shape(name)[1])
+        local_sketch = self.second_moment_sketches.pop(name, None)
+        if local_sketch is None:
+            local_sketch = torch.zeros(
+                (probe.shape[0], probe.shape[1]),
+                dtype=torch.float32,
+                device=self.accumulation_device,
             )
+        # These three buffers are already identical on every rank, having been
+        # accumulated from reduced batch gradients. Reducing them again is
+        # idempotent rather than wrong -- both numerator and denominator pick
+        # up the same factor of the world size -- and it keeps one code path
+        # for both mixing modes while cross-checking that the ranks agree on
+        # how many batches were committed.
         gradient, total_batches = self._distributed_mean(
-            self.gradients.pop(name),
+            local_gradient,
             local_batches,
         )
         moment_sketch, sketch_batches = self._distributed_mean(
-            self.second_moment_sketches.pop(name),
+            local_sketch,
             local_batches,
         )
         moment_trace_tensor, trace_batches = self._distributed_mean(
             torch.tensor(
-                self.second_moment_traces[name],
+                self.second_moment_traces.get(name, 0.0),
                 dtype=torch.float32,
                 device=self.accumulation_device,
             ),
@@ -656,15 +849,45 @@ class GradLoRACalibrator:
             else gradient.device
         )
         total_calls = self._distributed_total_count(
-            self.calls[name],
+            self.calls.get(name, 0),
             count_device,
         )
+        self.second_moment_probes.pop(name, None)
         return (
             gradient,
             total_calls,
             moment_sketch,
             float(moment_trace_tensor.item()),
-            self.second_moment_probes.pop(name),
+            probe,
+        )
+
+    @staticmethod
+    @torch.no_grad()
+    def _mean_right_eigensystem(
+        matrix: torch.Tensor,
+        q: int,
+        niter: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Descending top-``q`` right singular system of the mean gradient.
+
+        This is the ``beta = 0`` criterion: the eigenvectors of
+        ``C_0 = GbarT_Gbar / ||Gbar||_F^2`` are the right singular vectors of
+        ``Gbar``, and its eigenvalues are ``sigma_i^2 / ||Gbar||_F^2``.
+        """
+        _, singular_values, right_vectors = torch.svd_lowrank(
+            matrix,
+            q=q,
+            niter=int(niter),
+        )
+        order = singular_values.argsort(descending=True)
+        return right_vectors[:, order], singular_values[order]
+
+    @staticmethod
+    def sigma_is_degenerate(moment_trace: float, mean_energy: float) -> bool:
+        """Whether the gradient covariance carries no usable signal."""
+        return (
+            float(moment_trace) - float(mean_energy)
+            <= SIGMA_TRACE_TOL * max(float(mean_energy), 1e-24)
         )
 
     @torch.no_grad()
@@ -673,22 +896,45 @@ class GradLoRACalibrator:
         matrix: torch.Tensor,
         probe: torch.Tensor,
         moment_sketch: torch.Tensor,
+        moment_trace: float,
+        mean_energy: float,
         layer_rank: int,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """Nystrom eigensystem of the shrinkage-mixed gradient second moment.
+        """Nystrom eigensystem of the trace-normalised mixed criterion.
 
-        Mixes ``G^T G`` of the mean gradient with the per-batch energy
-        ``E[G_i^T G_i]`` and returns orthonormal right vectors as columns
-        together with a singular-value-scaled spectrum, or ``None`` when the
-        sketch is numerically rank-deficient.
+        Selects the dominant eigenspace of
+
+            C_beta = (1 - beta) * GbarT_Gbar / ||Gbar||_F^2
+                   + beta * Sigma / tr(Sigma),      Sigma = M - GbarT_Gbar
+
+        which has unit trace for every ``beta``. Both the normalisation and the
+        centring matter. Without them the raw second moment carries a trace
+        larger than ``||Gbar||_F^2`` by the factor ``snr``, so any
+        non-negligible mixing weight is dominated by it and ``beta`` behaves as
+        a binary switch rather than a convex interpolation; and the uncentred
+        term still contains the mean component that the first term already
+        supplies, so the weight double-counts it.
+
+        Neither ``C_beta`` nor ``Sigma`` is ever formed: the centring is one
+        subtraction on the sketched side. Returns orthonormal right vectors as
+        columns with a singular-value-scaled spectrum, or ``None`` when the
+        Nystrom core is numerically rank-deficient. Callers must rule out a
+        degenerate ``Sigma`` with :meth:`sigma_is_degenerate` first.
         """
         probe_matrix = probe.to(matrix.device, dtype=torch.float32)
         mean_sketch = matrix.transpose(0, 1) @ (matrix @ probe_matrix)
-        mixed_sketch = (
-            (1.0 - self.second_moment_beta) * mean_sketch
-            + self.second_moment_beta
-            * moment_sketch.to(matrix.device, dtype=torch.float32)
+        trace_sigma = float(moment_trace) - float(mean_energy)
+        if trace_sigma <= 0.0:
+            raise ValueError(
+                "GradLoRA mixed criterion requires a positive tr(Sigma); "
+                "call sigma_is_degenerate() before this method"
+            )
+        sigma_sketch = (
+            moment_sketch.to(matrix.device, dtype=torch.float32) - mean_sketch
         )
+        mixed_sketch = (
+            (1.0 - self.second_moment_beta) / max(float(mean_energy), 1e-24)
+        ) * mean_sketch + (self.second_moment_beta / trace_sigma) * sigma_sketch
         eigensystem = self._nystrom_eigh(probe_matrix, mixed_sketch, layer_rank)
         if eigensystem is None:
             return None
@@ -772,20 +1018,22 @@ class GradLoRACalibrator:
             layer_rank = min(rank, rows, cols)
             q = min(layer_rank + max(int(oversample), 0), rows, cols)
             gradient_fro_sq = float(gradient.float().pow(2).sum().item())
-            objective_energy = gradient_fro_sq
+            gradient_snr = float("nan")
+            sigma_degenerate = False
             if self.use_second_moment:
-                objective_energy = (
-                    (1.0 - self.second_moment_beta) * gradient_fro_sq
-                    + self.second_moment_beta * moment_trace
-                )
                 if (
-                    not math.isfinite(objective_energy)
+                    not math.isfinite(moment_trace)
                     or not torch.isfinite(moment_sketch).all()
                 ):
                     raise FloatingPointError(
                         f"GradLoRA second moment for {name} contains "
                         "non-finite values"
                     )
+                if gradient_fro_sq > 0.0:
+                    gradient_snr = moment_trace / gradient_fro_sq
+                sigma_degenerate = self.sigma_is_degenerate(
+                    moment_trace, gradient_fro_sq
+                )
             row_scale, write_gain = _resolve_a_row_scale(
                 self.modules[name],
                 _active_adapter_name(self.modules[name]),
@@ -810,7 +1058,7 @@ class GradLoRACalibrator:
                     raise FloatingPointError(
                         f"GradLoRA gradient for {name} contains non-finite values"
                     )
-                if objective_energy <= 0.0:
+                if gradient_fro_sq <= 0.0:
                     # Some SD3 modules are structurally inactive. In particular,
                     # the final context_pre_only block computes add_q_proj only
                     # for a context output that is discarded, so its exact
@@ -819,62 +1067,45 @@ class GradLoRACalibrator:
                     initialization = "standard_lora_fallback"
                     zero_gradient_layers.append(name)
                 else:
-                    if self.use_second_moment:
-                        eigensystem = self._mixed_right_eigensystem(
+                    mixed_eigensystem = None
+                    if self.use_second_moment and not sigma_degenerate:
+                        mixed_eigensystem = self._mixed_right_eigensystem(
                             matrix,
                             probe,
                             moment_sketch,
+                            moment_trace,
+                            gradient_fro_sq,
                             layer_rank,
                         )
-                        if eigensystem is None:
-                            # Rank-0-only numerical failure: fall back to the
-                            # mean-gradient SVD so distributed ranks stay in sync.
-                            initialization = "gradient_svd"
-                            _, singular_values, right_vectors = torch.svd_lowrank(
-                                matrix,
-                                q=q,
-                                niter=int(niter),
-                            )
-                            order = singular_values.argsort(descending=True)
-                            singular_values = singular_values[order]
-                            right_vectors = right_vectors[:, order]
-                            init_a = (
-                                right_vectors[:, :layer_rank]
-                                .transpose(0, 1)
-                                .contiguous()
-                            )
-                            initializer_spectrum = singular_values[:layer_rank]
-                            kept_energy = float(
-                                singular_values[:layer_rank].pow(2).sum().item()
-                                / max(gradient_fro_sq, 1e-24)
-                            )
-                            sigma_max = float(singular_values[0].item())
-                            sigma_min_kept = float(
-                                singular_values[layer_rank - 1].item()
-                            )
-                        else:
-                            right_vectors, initializer_spectrum = eigensystem
-                            init_a = right_vectors.transpose(0, 1).contiguous()
-                            kept_energy = float(
-                                min(
-                                    initializer_spectrum.pow(2).sum().item()
-                                    / max(objective_energy, 1e-24),
-                                    1.0,
-                                )
-                            )
-                            sigma_max = float(initializer_spectrum[0].item())
-                            sigma_min_kept = float(
-                                initializer_spectrum[layer_rank - 1].item()
-                            )
-                    else:
-                        _, singular_values, right_vectors = torch.svd_lowrank(
-                            matrix,
-                            q=q,
-                            niter=int(niter),
+                    if self.use_second_moment and mixed_eigensystem is not None:
+                        right_vectors, initializer_spectrum = mixed_eigensystem
+                        init_a = right_vectors.transpose(0, 1).contiguous()
+                        # tr(C_beta) = 1 by construction, so the retained
+                        # eigenvalues are already the captured fraction. Left
+                        # unclamped: a value above one can only come from the
+                        # Nystrom sketch, and hiding that would hide the very
+                        # approximation error the audit has to detect.
+                        kept_energy = float(
+                            initializer_spectrum.pow(2).sum().item()
                         )
-                        order = singular_values.argsort(descending=True)
-                        singular_values = singular_values[order]
-                        right_vectors = right_vectors[:, order]
+                        sigma_max = float(initializer_spectrum[0].item())
+                        sigma_min_kept = float(
+                            initializer_spectrum[layer_rank - 1].item()
+                        )
+                    else:
+                        if self.use_second_moment:
+                            # Record which of the two reasons forced beta = 0 on
+                            # this layer: a covariance that carries no signal is
+                            # a property of the data, a rank-deficient Nystrom
+                            # core is a property of the sketch.
+                            initialization = (
+                                "gradient_svd_sigma_degenerate"
+                                if sigma_degenerate
+                                else "gradient_svd_nystrom_fallback"
+                            )
+                        right_vectors, singular_values = (
+                            self._mean_right_eigensystem(matrix, q, niter)
+                        )
                         init_a = (
                             right_vectors[:, :layer_rank]
                             .transpose(0, 1)
@@ -902,17 +1133,14 @@ class GradLoRACalibrator:
                         # Compute this in every arm, even when it will not be
                         # selected, so randomized SVD consumes the same CUDA RNG
                         # stream before frozen-A training in all three arms.
-                        _, mean_values, mean_vectors = torch.svd_lowrank(
-                            matrix,
-                            q=q,
-                            niter=int(niter),
+                        mean_vectors, mean_values = self._mean_right_eigensystem(
+                            matrix, q, niter
                         )
-                        mean_order = mean_values.argsort(descending=True)
                         mean_a = _apply_spectral_exponent(
-                            mean_vectors[:, mean_order][:, :layer_rank]
+                            mean_vectors[:, :layer_rank]
                             .transpose(0, 1)
                             .contiguous(),
-                            mean_values[mean_order][:layer_rank],
+                            mean_values[:layer_rank],
                             spectral_exponent,
                             row_scale,
                         )
@@ -920,15 +1148,12 @@ class GradLoRACalibrator:
                         init_a = mean_a
                         initialization = "control_mean"
                         kept_energy = float(
-                            mean_values[mean_order][:layer_rank]
-                            .pow(2)
-                            .sum()
-                            .item()
+                            mean_values[:layer_rank].pow(2).sum().item()
                             / max(gradient_fro_sq, 1e-24)
                         )
-                        sigma_max = float(mean_values[mean_order][0].item())
+                        sigma_max = float(mean_values[0].item())
                         sigma_min_kept = float(
-                            mean_values[mean_order][layer_rank - 1].item()
+                            mean_values[layer_rank - 1].item()
                         )
                     elif init_variant == "random":
                         random_a = self._orthonormal_rows(
@@ -947,7 +1172,7 @@ class GradLoRACalibrator:
                         sigma_min_kept = 0.0
                         init_a = random_a.to(init_a.device, init_a.dtype)
                         initialization = "control_random"
-            elif objective_energy > 0.0:
+            elif gradient_fro_sq > 0.0:
                 init_a = torch.empty(
                     layer_rank,
                     cols,
@@ -957,7 +1182,7 @@ class GradLoRACalibrator:
             else:
                 initialization = "standard_lora_fallback"
 
-            # All ranks agree on objective_energy after the all-reduce above, so
+            # All ranks agree on gradient_fro_sq after the all-reduce above, so
             # either every rank has an init_a buffer or every rank falls back.
             if distributed and init_a is not None:
                 init_a = init_a.to(communication_device)
@@ -977,6 +1202,8 @@ class GradLoRACalibrator:
                     mean_a = mean_a.to(communication_device)
                     dist.broadcast(mean_a, src=0)
                 mean_gradient = gradient.detach().to("cpu", dtype=torch.float32)
+                if self.keep_calibration_gradients:
+                    self.probe_calibration_gradients[name] = mean_gradient
                 # A rows are only orthonormal when spectral_exponent == 0, so
                 # re-orthonormalize before using them as a subspace basis.
                 self._register_probe_variant("selected", name, init_a, mean_gradient)
@@ -988,8 +1215,22 @@ class GradLoRACalibrator:
                     self._random_probe_basis(name, cols, layer_rank),
                     mean_gradient,
                 )
+                complement = self._complement_probe_basis(
+                    name,
+                    self.probe_subspaces["selected"][name],
+                )
+                if complement is not None:
+                    self._register_probe_variant(
+                        "complement",
+                        name,
+                        complement,
+                        mean_gradient,
+                    )
+                    self._assert_probe_complement(name)
 
             if process_rank == 0:
+                flatness = _spectral_flatness(initializer_spectrum)
+                adam_cosine = _first_step_adam_cosine(gradient, init_a)
                 diagnostics.append(
                     GradLoRALayerDiagnostic(
                         name=name,
@@ -1005,6 +1246,9 @@ class GradLoRACalibrator:
                         a_row_norm_scale=row_scale,
                         a_scale_mode=self.a_scale_mode,
                         write_gain=write_gain,
+                        gradient_snr=gradient_snr,
+                        spectral_flatness=flatness,
+                        predicted_adam_cosine=adam_cosine,
                     )
                 )
             del gradient
@@ -1050,8 +1294,7 @@ class GradLoRACalibrator:
             }
             if metadata:
                 payload.update(metadata)
-            with open(diagnostics_path, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2)
+            write_json_report(diagnostics_path, payload, indent=2)
             main_print(f"--> GradLoRA diagnostics saved to {diagnostics_path}")
 
         if process_rank == 0 and zero_gradient_layers:
@@ -1089,20 +1332,81 @@ class GradLoRACalibrator:
         return result * (float(target_row_rms) / float(current_row_rms.item()))
 
     @staticmethod
-    def _random_probe_basis(name: str, cols: int, layer_rank: int) -> torch.Tensor:
+    def _probe_seed(name: str, salt: str = "") -> int:
+        """Layer-specific seed that every rank reproduces without communicating."""
+        digest = hashlib.sha256(f"{name}{salt}".encode("utf-8")).digest()[:8]
+        return int.from_bytes(digest, "big", signed=False) % (2**63)
+
+    @classmethod
+    def _random_probe_basis(
+        cls,
+        name: str,
+        cols: int,
+        layer_rank: int,
+    ) -> torch.Tensor:
         """Draw a layer-specific Haar subspace that every rank reproduces."""
-        seed = int.from_bytes(
-            hashlib.sha256(name.encode("utf-8")).digest()[:8],
-            "big",
-            signed=False,
-        ) % (2**63)
-        generator = torch.Generator(device="cpu").manual_seed(seed)
+        generator = torch.Generator(device="cpu").manual_seed(cls._probe_seed(name))
         return torch.randn(
             layer_rank,
             cols,
             generator=generator,
             dtype=torch.float32,
         )
+
+    @classmethod
+    def _complement_probe_basis(
+        cls,
+        name: str,
+        selected_basis: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Seeded random ``r``-frame inside the complement of ``selected_basis``.
+
+        ``selected_basis`` carries the selected subspace as columns. Drawing
+        from ``range(I - V V^T)`` gives the only arm that can refute the
+        method: a subspace built to avoid the dominant directions entirely. If
+        it scores no worse on held-out gradients, the rank budget is being
+        spent in the wrong place and energy capture is the wrong objective.
+
+        Returns ``None`` when the complement is too narrow to hold ``r``
+        orthonormal directions, which cannot happen at the ranks used here.
+        """
+        cols, layer_rank = selected_basis.shape
+        if cols - layer_rank < layer_rank:
+            return None
+        generator = torch.Generator(device="cpu").manual_seed(
+            cls._probe_seed(name, ":complement")
+        )
+        draw = torch.randn(
+            cols,
+            layer_rank,
+            generator=generator,
+            dtype=torch.float32,
+        )
+        basis = selected_basis.detach().float().cpu()
+        projected = draw - basis @ (basis.transpose(0, 1) @ draw)
+        complement = torch.linalg.qr(projected, mode="reduced").Q
+        return complement.transpose(0, 1).contiguous()
+
+    def _assert_probe_complement(self, name: str, tolerance: float = 1e-5) -> None:
+        """Verify the stored complement basis is orthonormal and disjoint."""
+        selected = self.probe_subspaces["selected"][name].float()
+        complement = self.probe_subspaces["complement"][name].float()
+        overlap = float(
+            (selected.transpose(0, 1) @ complement).norm().item()
+        )
+        gram_error = float(
+            (
+                complement.transpose(0, 1) @ complement
+                - torch.eye(complement.shape[1], dtype=complement.dtype)
+            )
+            .norm()
+            .item()
+        )
+        if overlap >= tolerance or gram_error >= tolerance:
+            raise RuntimeError(
+                f"GradLoRA complement probe basis for {name} is invalid: "
+                f"||V^T Q||_F={overlap:.3e}, ||Q^T Q - I||_F={gram_error:.3e}"
+            )
 
     def _register_probe_variant(
         self,
@@ -1175,15 +1479,82 @@ class GradLoRACalibrator:
         return [float(item) for item in packed.tolist()], dist.get_world_size()
 
     @torch.no_grad()
+    def _reduced_batch_gradients(self) -> dict[str, torch.Tensor]:
+        """Data-parallel mean of this batch's per-layer virtual gradients.
+
+        Used by both calibration and the held-out probe, which is the point:
+        one batch means one *global* batch on both sides. Any per-rank
+        alternative silently redefines the batch, and every quantity that is a
+        statement about between-batch spread -- ``snr``, ``Sigma``, the beta
+        mixture, the held-out/calibration comparison -- would then be read
+        against the wrong noise level.
+
+        Layers are iterated in a fixed order and missing ones contributed as
+        zeros, because a layer can be inactive on one rank and active on
+        another, and the ranks must agree on the collective schedule.
+        """
+        local = {
+            name: tensor.to(self.accumulation_device, dtype=torch.float32)
+            for name, tensor in self.batch_gradients.items()
+        }
+        if not (dist.is_available() and dist.is_initialized()):
+            return local
+
+        backend = dist.get_backend()
+        reduce_device = (
+            torch.device("cuda", torch.cuda.current_device())
+            if backend == "nccl"
+            else torch.device("cpu")
+        )
+        world_size = dist.get_world_size()
+        reduced: dict[str, torch.Tensor] = {}
+        for name in sorted(self.modules):
+            module = self.modules[name]
+            shape = (
+                int(module.base_layer.out_features),
+                int(module.base_layer.in_features),
+            )
+            tensor = local.get(name)
+            packed = (
+                torch.zeros(shape, dtype=torch.float32, device=reduce_device)
+                if tensor is None
+                else tensor.to(reduce_device)
+            )
+            dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+            packed /= world_size
+            reduced[name] = packed.to(self.accumulation_device)
+        return reduced
+
+    @torch.no_grad()
     def _finish_probe_batch(self) -> None:
-        """Score one held-out batch against the calibrated subspaces."""
+        """Score one held-out batch against the calibrated subspaces.
+
+        A rank that captured nothing must still run every collective below
+        with a zero contribution. Returning early instead would leave the
+        remaining ranks waiting in an all-reduce that never completes, and a
+        ReLU-clipped reward makes an empty rank a routine occurrence rather
+        than an edge case.
+        """
         if not self.batch_gradients:
             main_print(
                 "[warning] GradLoRA usefulness probe captured no layer "
-                "gradients; skipping this held-out batch"
+                "gradients on this rank; contributing zeros to this held-out "
+                "batch"
             )
-            return
 
+        if self.probe_reduce_gradients:
+            reduced = self._reduced_batch_gradients()
+            if self.probe_observer is not None:
+                self.probe_observer.observe_batch(
+                    self._probe_batch_index,
+                    reduced,
+                )
+            self._probe_batch_index += 1
+
+        # The legacy per-variant summary below stays on this rank's own shard,
+        # so it treats each shard as a sample and reads at a different noise
+        # level than the RQ3 report, which scores global batches. Both are
+        # internally consistent; the RQ3 report is the one the write-up quotes.
         device = self.moment_compute_device
         gradients = {
             name: tensor.to(device, dtype=torch.float32)
@@ -1220,15 +1591,26 @@ class GradLoRACalibrator:
             direction_norm = math.sqrt(
                 sum(self.probe_reference_energy[variant].values())
             )
+            cosine_defined = direction_norm > 0.0 and held_out_energy > 0.0
+            # A NaN from an empty rank would propagate through the sum and
+            # destroy the cosine for every rank, so undefined ranks contribute
+            # zero and are excluded from the denominator instead.
             local_cosine = (
                 reference_dot / (direction_norm * math.sqrt(held_out_energy))
-                if direction_norm > 0.0 and held_out_energy > 0.0
-                else float("nan")
+                if cosine_defined
+                else 0.0
             )
-            reduced, world_size = self._reduce_sum(
-                [held_out_energy, captured_energy, reference_dot, local_cosine]
+            reduced, _ = self._reduce_sum(
+                [
+                    held_out_energy,
+                    captured_energy,
+                    reference_dot,
+                    local_cosine,
+                    1.0 if cosine_defined else 0.0,
+                ]
             )
-            total_energy, total_captured, total_dot, cosine_sum = reduced
+            total_energy, total_captured, total_dot, cosine_sum = reduced[:4]
+            cosine_samples = int(round(reduced[4]))
             self.probe_batch_records[variant].append(
                 {
                     "held_out_energy": total_energy,
@@ -1239,8 +1621,12 @@ class GradLoRACalibrator:
                         if total_energy > 0.0
                         else float("nan")
                     ),
-                    "alignment_cosine": cosine_sum / world_size,
-                    "samples": world_size,
+                    "alignment_cosine": (
+                        cosine_sum / cosine_samples
+                        if cosine_samples > 0
+                        else float("nan")
+                    ),
+                    "samples": cosine_samples,
                 }
             )
         self.batch_gradients.clear()
@@ -1368,8 +1754,7 @@ class GradLoRACalibrator:
                 os.path.dirname(os.path.abspath(diagnostics_path)),
                 exist_ok=True,
             )
-            with open(diagnostics_path, "w", encoding="utf-8") as f:
-                json.dump(summary, f, indent=2)
+            write_json_report(diagnostics_path, summary, indent=2)
             main_print(f"--> GradLoRA usefulness saved to {diagnostics_path}")
 
         for variant in sorted(variants):

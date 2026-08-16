@@ -23,6 +23,7 @@ from flowbp.utils.gradlora_adapter import (
     _active_adapter_name,
     _is_lora_linear,
     _model_context,
+    write_json_report,
 )
 from flowbp.utils.logging_ import main_print
 from flowbp.utils.peft_adapter import (
@@ -286,7 +287,7 @@ class LoRAGACalibrator(GradLoRACalibrator):
                     gradient,
                     total_calls,
                     moment_sketch,
-                    _,
+                    moment_trace,
                     probe,
                 ) = self._pop_layer_state(name)
             else:
@@ -355,15 +356,23 @@ class LoRAGACalibrator(GradLoRACalibrator):
                 right_vectors = right_vectors[:, order]
                 a_basis = right_vectors[:, :rank]
                 if self.use_second_moment:
-                    eigensystem = self._mixed_right_eigensystem(
-                        matrix,
-                        probe,
-                        moment_sketch,
-                        rank,
-                    )
+                    eigensystem = None
+                    if not self.sigma_is_degenerate(
+                        moment_trace, gradient_fro_sq
+                    ):
+                        eigensystem = self._mixed_right_eigensystem(
+                            matrix,
+                            probe,
+                            moment_sketch,
+                            moment_trace,
+                            gradient_fro_sq,
+                            rank,
+                        )
                     if eigensystem is None:
-                        # Rank-0-only numerical failure. Keep the mean-gradient
-                        # subspace so every rank still receives one broadcast.
+                        # A degenerate covariance or a rank-deficient Nystrom
+                        # core both mean beta = 0 for this layer. Keep the
+                        # mean-gradient subspace so every rank still receives
+                        # one broadcast.
                         initialization = "gradient_svd_second_moment_fallback"
                     else:
                         a_basis = eigensystem[0]
@@ -500,8 +509,7 @@ class LoRAGACalibrator(GradLoRACalibrator):
             }
             if metadata:
                 payload.update(metadata)
-            with open(diagnostics_path, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle, indent=2)
+            write_json_report(diagnostics_path, payload, indent=2)
             main_print(f"--> LoRA-GA diagnostics saved to {diagnostics_path}")
 
         if process_rank == 0 and fallback_layers:

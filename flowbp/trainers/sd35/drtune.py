@@ -12,6 +12,11 @@ from flowbp.trainers.sd35.leapalign import (
     _sample_initial_latents,
     run_training_sd35,
 )
+from flowbp.trainers.sd35.reward_input import (
+    attach_sampled_endpoint,
+    finish_rollout_sd35,
+    uses_sampled_endpoint,
+)
 
 DEFAULT_DRTUNE_NUM_TRAIN_STEPS = 3
 DEFAULT_DRTUNE_EARLY_STOP_RATIO = 0.4
@@ -105,6 +110,7 @@ def sample_drtune_trajectory_sd35(
     train_index_set = set(train_indices)
     executed_train_indices: list[int] = []
     latents_pred_x0 = None
+    latents_next = None
 
     for idx, step_t in enumerate(timesteps):
         model_input = latents_xt.detach()
@@ -135,7 +141,7 @@ def sample_drtune_trajectory_sd35(
             pred = pred.detach()
 
         if idx == early_stop_idx:
-            _, latents_pred_x0 = fm_scheduler.step(
+            latents_next, latents_pred_x0 = fm_scheduler.step(
                 pred,
                 step_t,
                 latents_xt,
@@ -157,6 +163,23 @@ def sample_drtune_trajectory_sd35(
     if latents_pred_x0.dtype != torch.bfloat16:
         latents_pred_x0 = latents_pred_x0.to(torch.bfloat16)
 
+    endpoint_reward = uses_sampled_endpoint(args)
+    if endpoint_reward:
+        x0_true = finish_rollout_sd35(
+            args,
+            transformer,
+            fm_scheduler,
+            latents_next,
+            timesteps,
+            early_stop_idx + 1,
+            prompt_embeds,
+            pooled_prompt_embeds,
+            negative_prompt_embeds,
+            negative_pooled_prompt_embeds,
+        )
+        latents_pred_x0 = attach_sampled_endpoint(latents_pred_x0, x0_true)
+        latents_xt = x0_true
+
     traj_metrics = {
         "d0": None,
         "dj": None,
@@ -170,12 +193,16 @@ def sample_drtune_trajectory_sd35(
         "drtune_early_stop_idx": torch.tensor(
             early_stop_idx, device=device, dtype=torch.float32,
         ),
+        "reward_input_sampled_x0": torch.tensor(
+            1.0 if endpoint_reward else 0.0, device=device, dtype=torch.float32,
+        ),
     }
     args._last_connector_payload = {
         "step": getattr(args, "current_train_step", None),
         "train_indices": train_indices,
         "executed_train_indices": executed_train_indices,
         "early_stop_idx": int(early_stop_idx),
+        "reward_input_sampled_x0": bool(endpoint_reward),
         "connector_scheme": "sd35_drtune_stop_gradient",
     }
     _maybe_save_connector_dump(args, "sd35_drtune", args._last_connector_payload)

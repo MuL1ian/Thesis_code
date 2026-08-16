@@ -503,6 +503,67 @@ def build_parser(backend: str) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--use_rq3_probe",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Score the held-out probe under the RQ3 protocol: adds the "
+            "complement arm, normalizes every metric by the pooled held-out "
+            "oracle, and reports per-batch and pooled budgets side by side "
+            "with paired per-layer contrasts. Requires a positive "
+            "--gradlora_usefulness_batches."
+        ),
+    )
+    parser.add_argument(
+        "--rq3_report_path",
+        type=str,
+        default=None,
+        help=(
+            "Optional JSON path for the RQ3 held-out probe report. Defaults "
+            "to <output_dir>/rq3_heldout_probe.json."
+        ),
+    )
+    parser.add_argument(
+        "--rq3_score_device",
+        type=str,
+        default="cpu",
+        help=(
+            "Device holding held-out gradients during RQ3 scoring. Every "
+            "held-out batch is retained until the pooled oracle is known, so "
+            "this is the memory-heavy choice; cpu is the safe default."
+        ),
+    )
+    parser.add_argument(
+        "--rq3_layer_sample",
+        type=int,
+        default=None,
+        help=(
+            "Score only this many layers, sampled evenly within each module "
+            "type. Cuts retained memory proportionally; the paired per-layer "
+            "statistics stay valid on the subset. Default scores every layer."
+        ),
+    )
+    parser.add_argument(
+        "--rq3_max_retained_gib",
+        type=float,
+        default=64.0,
+        help=(
+            "Abort the RQ3 probe if the projected held-out gradient cache "
+            "exceeds this many GiB, instead of risking an OOM kill."
+        ),
+    )
+    parser.add_argument(
+        "--rq3_batch_oracle_ratio",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Also report how much better each held-out batch's own leading "
+            "subspace is than the pooled oracle. Diagnostic only, and costs "
+            "one exact eigendecomposition per layer per held-out batch, so it "
+            "is off by default."
+        ),
+    )
+    parser.add_argument(
         "--use_oft",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -662,6 +723,19 @@ def build_parser(backend: str) -> argparse.ArgumentParser:
         help=(
             "Reward optimization loss. 'hinge' keeps relu(-reward + "
             "loss_relu_clip); 'neg_reward' directly maximizes via -reward."
+        ),
+    )
+    parser.add_argument(
+        "--reward_input_mode",
+        type=str,
+        default="posterior_mean",
+        choices=["posterior_mean", "sampled_x0"],
+        help=(
+            "Which image the reward model scores. 'posterior_mean' is the "
+            "per-step x0 estimate used by ReFL and DRTune. 'sampled_x0' "
+            "finishes the rollout under no_grad and swaps the forward value "
+            "for the sampled endpoint via a straight-through residual, "
+            "leaving the active set and gradient path untouched."
         ),
     )
     parser.add_argument(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import time
 from collections import deque
@@ -62,8 +63,16 @@ from flowbp.utils.fsdp_util import apply_fsdp_checkpointing, get_dit_fsdp_kwargs
 from flowbp.utils.gradlora_adapter import (
     GradLoRACalibrator,
     apply_gradlora_if_enabled,
+    assert_lora_b_is_zero,
+    trainable_parameter_digest,
+    write_json_report,
 )
 from flowbp.utils.logging_ import main_print
+from flowbp.utils.rq3_probe import (
+    RQ3ProbeScorer,
+    assert_probe_cache_fits,
+    build_report as build_rq3_report,
+)
 from flowbp.utils.loraga_adapter import (
     LoRAGACalibrator,
     apply_loraga_if_enabled,
@@ -1228,6 +1237,32 @@ def run_training_sd35(args):
             args.output_dir or ".",
             "gradlora_usefulness.json",
         )
+        use_rq3_probe = bool(getattr(args, "use_rq3_probe", False))
+        if use_rq3_probe and usefulness_batches < 1:
+            raise ValueError(
+                "RQ3 scoring needs held-out batches; set "
+                "rq3.heldout_batches (or --gradlora_usefulness_batches) "
+                "to a positive value"
+            )
+        rq3_report_path = getattr(args, "rq3_report_path", None) or os.path.join(
+            args.output_dir or ".",
+            "rq3_heldout_probe.json",
+        )
+        # The probe consumes the batches immediately after calibration from the
+        # same infinite iterator, so they are disjoint exactly while both fit
+        # in one epoch. Past that the sampler wraps and the "held-out" batches
+        # are the calibration prompts again, which would inflate every score.
+        available_batches = len(train_dataloader)
+        if (
+            usefulness_batches > 0
+            and calibration_batches + usefulness_batches > available_batches
+        ):
+            raise ValueError(
+                f"GradLoRA needs {calibration_batches} calibration + "
+                f"{usefulness_batches} held-out batches but the loader yields "
+                f"only {available_batches} per epoch; the held-out batches "
+                "would repeat calibration prompts"
+            )
         init_variant = str(
             getattr(args, "gradlora_init_variant", "selected")
         ).lower()
@@ -1235,6 +1270,17 @@ def run_training_sd35(args):
             raise ValueError(
                 "gradlora_init_variant must be 'selected', 'mean', or "
                 f"'random', got {init_variant!r}"
+            )
+        if use_rq3_probe and init_variant != "selected":
+            # A control variant overwrites the initializer that the probe then
+            # registers as the `selected` arm, so `selected` would silently be
+            # a duplicate of `mean` or `random` and the complement arm would be
+            # built against the wrong subspace. RQ3 asks whether the deployed
+            # operator picks the right subspace, so it needs the deployed one.
+            raise ValueError(
+                "RQ3 scoring requires gradlora.init_variant='selected'; "
+                f"got {init_variant!r}, whose subspace is a control arm "
+                "rather than the operator under test"
             )
         a_scale_mode = str(
             getattr(args, "gradlora_a_scale_mode", "legacy")
@@ -1262,6 +1308,10 @@ def run_training_sd35(args):
             a_scale_mode=a_scale_mode,
             a_scale=a_scale,
         )
+        # A dense copy of every target layer's mean gradient, needed only by
+        # the RQ3 oracle. Kept on the scoring rank alone rather than on all of
+        # them, which would multiply several GiB by the world size for nothing.
+        calibrator.keep_calibration_gradients = use_rq3_probe and rank == 0
         optimizer.zero_grad(set_to_none=True)
         args.current_train_step = 0
         nonzero_calibration_batches = 0
@@ -1311,7 +1361,7 @@ def run_training_sd35(args):
                 "reward-gradient direction can be estimated. Adjust "
                 "loss_relu_clip or the calibration data before retrying."
             )
-        calibrator.finalize(
+        calibration_diagnostics = calibrator.finalize(
             rank=int(args.gradlora_rank),
             spectral_exponent=spectral_exponent,
             oversample=int(args.gradlora_svd_oversample),
@@ -1350,7 +1400,67 @@ def run_training_sd35(args):
                 f"***** GradLoRA usefulness probe: {usefulness_batches} "
                 "held-out batches *****"
             )
+            # The probe is only a measurement if the model it measures is the
+            # calibrated one. Both conditions are checked again afterwards.
+            assert_lora_b_is_zero(transformer, context="entering the probe")
+            probe_entry_digest = trainable_parameter_digest(transformer)
+            if use_rq3_probe:
+                # Checked on every rank from the same shapes so they abort
+                # together, and before rank 0 allocates anything.
+                projected_gib = assert_probe_cache_fits(
+                    {
+                        name: (
+                            int(module.base_layer.out_features),
+                            int(module.base_layer.in_features),
+                        )
+                        for name, module in calibrator.modules.items()
+                    },
+                    batches=usefulness_batches,
+                    max_retained_gib=float(
+                        getattr(args, "rq3_max_retained_gib", 64.0)
+                    ),
+                    layer_sample=getattr(args, "rq3_layer_sample", None),
+                )
+                main_print(
+                    f"--> RQ3 probe will retain about {projected_gib:.1f} GiB "
+                    "of held-out gradients on rank 0"
+                )
             calibrator.begin_probe()
+            rq3_scorer = None
+            # Every rank has to take part in the gradient reduction, but only
+            # rank 0 keeps the held-out batches and scores them.
+            calibrator.probe_reduce_gradients = use_rq3_probe
+            if use_rq3_probe and rank == 0:
+                # Layers that fell back to random initialisation carry no
+                # calibrated subspace; leaving them in would drag `selected`
+                # toward `random` in every aggregate.
+                fallback_layers = {
+                    item.name
+                    for item in calibration_diagnostics
+                    if item.initialization == "standard_lora_fallback"
+                }
+                rq3_scorer = RQ3ProbeScorer(
+                    calibrator.probe_subspaces,
+                    calibrator.probe_references,
+                    calibrator.probe_calibration_gradients,
+                    rank=int(args.gradlora_rank),
+                    excluded_layers=fallback_layers,
+                    device=str(getattr(args, "rq3_score_device", "cpu")),
+                    compute_batch_oracle_ratio=bool(
+                        getattr(args, "rq3_batch_oracle_ratio", False)
+                    ),
+                    expected_batches=usefulness_batches,
+                    max_retained_gib=float(
+                        getattr(args, "rq3_max_retained_gib", 64.0)
+                    ),
+                    layer_sample=getattr(args, "rq3_layer_sample", None),
+                )
+                calibrator.probe_observer = rq3_scorer
+                main_print(
+                    f"--> RQ3 scoring enabled over arms "
+                    f"{', '.join(sorted(calibrator.probe_subspaces))}; "
+                    f"excluding {len(fallback_layers)} fallback layers"
+                )
             for probe_step in range(usefulness_batches):
                 avg_loss, avg_reward, _, _ = train_sd35_one_step(
                     args,
@@ -1383,6 +1493,13 @@ def run_training_sd35(args):
                     f"{probe_step + 1}/{usefulness_batches}: "
                     f"loss={avg_loss:.4f}, reward={avg_reward:.4f}"
                 )
+            assert_lora_b_is_zero(transformer, context="leaving the probe")
+            if trainable_parameter_digest(transformer) != probe_entry_digest:
+                raise RuntimeError(
+                    "GradLoRA probe modified trainable parameters; held-out "
+                    "batches must be scored on the calibrated model, so an "
+                    "optimizer step leaked into the probe loop"
+                )
             calibrator.finish_probe(
                 diagnostics_path=usefulness_path,
                 metadata={
@@ -1397,6 +1514,39 @@ def run_training_sd35(args):
                     "rank": int(args.gradlora_rank),
                 },
             )
+            calibrator.probe_reduce_gradients = False
+            if rq3_scorer is not None:
+                calibrator.probe_observer = None
+                report = build_rq3_report(
+                    rq3_scorer.finish(),
+                    ky_fan_violations=rq3_scorer.ky_fan_violations,
+                    excluded_layers=rq3_scorer.excluded_layers,
+                    metadata={
+                        "trainer": args.trainer,
+                        "k_cal": calibration_batches,
+                        "k_ho": usefulness_batches,
+                        "rank": int(args.gradlora_rank),
+                        "use_second_moment": use_second_moment,
+                        "second_moment_beta": (
+                            second_moment_beta if use_second_moment else 0.0
+                        ),
+                        "calibration_mode": calibration_mode,
+                        "global_batch_size": (
+                            int(args.train_batch_size) * world_size
+                        ),
+                    },
+                )
+                os.makedirs(
+                    os.path.dirname(os.path.abspath(rq3_report_path)),
+                    exist_ok=True,
+                )
+                write_json_report(
+                    rq3_report_path, report, indent=2, sort_keys=True
+                )
+                main_print(
+                    f"--> RQ3 held-out probe report written to "
+                    f"{rq3_report_path} ({report['layers_scored']} layers)"
+                )
             optimizer.zero_grad(set_to_none=True)
         if freeze_a:
             # FSDP fixes per-flat-parameter requires_grad at wrap time, so drop
