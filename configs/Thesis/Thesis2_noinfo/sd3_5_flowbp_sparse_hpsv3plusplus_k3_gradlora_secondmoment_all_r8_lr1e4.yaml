@@ -1,0 +1,49 @@
+# FlowLoRA (second-moment / beta=0.5), all Linear modules, on the Thesis2 Sparse K=3 trajectory.
+_base_: sd3_5_flowbp_sparse_hpsv3plusplus_k3.yaml
+
+train:
+  output_dir: outputs/Thesis/sd3_5_flowbp_sparse_hpsv3plusplus_k3_gradlora_secondmoment_all_r8_lr1e4
+
+optimizer:
+  # Low-rank adapters need a larger LR than the 1e-5 used by the full-finetune
+  # run. Every low-rank config in this panel shares 1e-4.
+  learning_rate: 1.0e-4
+
+gradlora:
+  enabled: true
+  # rank/alpha/target_modules match the LoRA r8 all-layer config so the only
+  # difference is how A is initialized (reward-gradient subspace vs random).
+  target_modules: default
+  rank: 8
+  alpha: 16
+  dropout: 0.0
+  spectral_exponent: 0.0
+  calibration_batches: 4
+  calibration_mode: sparse
+  accumulation_device: cpu
+  svd_device: cuda
+  svd_oversample: 8
+  svd_niter: 4
+  # Selects the top-r eigenspace of the trace-normalised mixed criterion
+  # C_beta = (1-beta) C_0 + beta Sigma/tr(Sigma). Both terms carry unit trace,
+  # so beta interpolates rather than switching between them.
+  use_second_moment: true
+  second_moment_beta: 0.5
+
+eval:
+  # Denser than the K=3 base, which evaluates every 100. The Stage 2 arms are
+  # compared on their curves as well as their final score.
+  evaluation_interval: 50
+
+logging:
+  run_name: sd3_5_flowbp_sparse_hpsv3plusplus_k3_gradlora_secondmoment_all_r8_lr1e4_bs4
+  tags:
+    - thesis
+    - hpsv3plusplus
+    - sd35
+    - flowbp-sparse
+    - k3
+    - gradlora
+    - second-moment
+    - all-layers
+    - rank-8

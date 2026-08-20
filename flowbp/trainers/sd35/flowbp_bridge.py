@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import torch
 
+from flowbp.trainers.common.alpha_coupling import alpha_coupled_input
 from flowbp.trainers.common.rollout_window import resolve_train_step_window
 from flowbp.trainers.sd35.flowbp_sparse import _sample_late_biased_indices
 from flowbp.trainers.sd35.flowbp_lagrange import _rollout_with_cache_sd35
@@ -277,7 +278,7 @@ def sample_flowbp_bridge_trajectory_sd35(
     xj_conn = xj_conn.to(torch.bfloat16)
 
     alpha = float(args.alpha)
-    xj_model_input = float(alpha) * xj_conn + (1.0 - float(alpha)) * xj_conn.detach()
+    xj_model_input = alpha_coupled_input(xj_conn, alpha)
 
     post_active_velocities = _build_flowbp_bridge_active_velocities_sd35(
         args=args,

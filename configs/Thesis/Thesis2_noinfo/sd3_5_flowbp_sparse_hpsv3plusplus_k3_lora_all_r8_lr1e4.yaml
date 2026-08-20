@@ -1,0 +1,35 @@
+# Standard LoRA, all Linear modules, on the Thesis2 Sparse K=3 trajectory.
+_base_: sd3_5_flowbp_sparse_hpsv3plusplus_k3.yaml
+
+train:
+  output_dir: outputs/Thesis/sd3_5_flowbp_sparse_hpsv3plusplus_k3_lora_all_r8_lr1e4
+
+optimizer:
+  # Low-rank adapters need a larger LR than the 1e-5 used by the full-finetune
+  # run. Every low-rank config in this panel shares 1e-4.
+  learning_rate: 1.0e-4
+
+lora:
+  enabled: true
+  # `default` = attention projections + feed-forward projections (all modules).
+  target_modules: default
+  rank: 8
+  alpha: 16
+  dropout: 0.0
+
+eval:
+  # Denser than the K=3 base, which evaluates every 100. The Stage 2 arms are
+  # compared on their curves as well as their final score.
+  evaluation_interval: 50
+
+logging:
+  run_name: sd3_5_flowbp_sparse_hpsv3plusplus_k3_lora_all_r8_lr1e4_bs4
+  tags:
+    - thesis
+    - hpsv3plusplus
+    - sd35
+    - flowbp-sparse
+    - k3
+    - lora
+    - all-layers
+    - rank-8

@@ -20,6 +20,7 @@ from __future__ import annotations
 import torch
 import torch.distributed as dist
 
+from flowbp.trainers.common.alpha_coupling import alpha_coupled_input
 from flowbp.trainers.common.rollout_window import resolve_train_step_window
 from flowbp.trainers.flux1.flowbp_sparse import (
     _sample_late_biased_indices,
@@ -298,7 +299,7 @@ def sample_flowbp_bridge_trajectory(
     xj_conn = xj_hat + (x_j - xj_hat).detach()
 
     alpha = float(args.alpha)
-    xj_model_input = float(alpha) * xj_conn + (1.0 - float(alpha)) * xj_conn.detach()
+    xj_model_input = alpha_coupled_input(xj_conn, alpha)
 
     post_active_velocities = _build_active_velocities(
         args=args,

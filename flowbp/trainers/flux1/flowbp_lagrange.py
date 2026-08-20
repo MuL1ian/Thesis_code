@@ -11,6 +11,7 @@ from flowbp.rewards.differentiable import (
     compute_differentiable_reward,
     reward_loss_values,
 )
+from flowbp.trainers.common.alpha_coupling import alpha_coupled_input
 from flowbp.trainers.common.jk_sampling import sample_jk_indices
 from flowbp.trainers.common.flowbp_lagrange_utils import (
     _lagrange_quadrature_predict,
@@ -358,7 +359,7 @@ def sample_flowbp_lagrange_trajectory(
             )
 
     alpha = float(args.alpha)
-    xj_model_input = float(alpha) * xj_conn + (1.0 - float(alpha)) * xj_conn.detach()
+    xj_model_input = alpha_coupled_input(xj_conn, alpha)
 
     support_j0 = _select_interval_support_indices(
         start_idx=j_idx,
