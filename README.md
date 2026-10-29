@@ -138,8 +138,8 @@ The experiments used Python 3.10, CUDA 12.4, PyTorch 2.6.0, and one node with
 eight GPUs.
 
 ```bash
-git clone https://github.com/MuL1ian/FlowBP-2.git
-cd FlowBP-2
+git clone https://github.com/MuL1ian/Thesis_code.git
+cd Thesis_code
 bash setup.sh
 ```
 
