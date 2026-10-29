@@ -1,441 +1,247 @@
-<h1 align="center">FlowBP</h1>
+<h1 align="center">FlowBP and GradLoRA</h1>
 
 <p align="center">
-  <b>Exploring the Design Space of Reward Backpropagation for Flow Matching</b>
+  Code for the honours thesis<br>
+  <b>Gradient Approximation for Reward Alignment in Generative Flow Models</b><br>
+  Boye Niu · Supervisor: Professor Yiming Ying · The University of Sydney, 2026
 </p>
 
 <p align="center">
-  <b>Official PyTorch Implementation</b>
-</p>
-
-<p align="center">
-  Ruoyu Wang<sup>1,2,*</sup>,
-  Boye Niu<sup>2,3,*</sup>,
-  Xiangxin Zhou<sup>2,*,†,‡</sup>,
-  Yushi Huang<sup>2,4</sup>,
-  Tongliang Liu<sup>3</sup>,
-  Chi Zhang<sup>1,‡</sup>
-</p>
-
-<p align="center">
-  <sup>1</sup>Westlake University &nbsp;
-  <sup>2</sup>Tencent Hunyuan &nbsp;
-  <sup>3</sup>University of Sydney &nbsp;
-  <sup>4</sup>The Hong Kong University of Science and Technology
-</p>
-
-<p align="center">
-  <sup>*</sup>Equal contribution &nbsp;
-  <sup>†</sup>Project lead &nbsp;
-  <sup>‡</sup>Corresponding author
-</p>
-
-<p align="center">
-  <a href="https://arxiv.org/abs/2606.11075">arXiv</a> |
-  <a href="#method-overview">Method</a> |
-  <a href="#main-results">Results</a> |
+  <a href="#flowbp">FlowBP</a> |
+  <a href="#gradlora">GradLoRA</a> |
+  <a href="#results">Results</a> |
   <a href="#installation">Installation</a> |
-  <a href="#quick-start">Quick Start</a> |
-  <a href="#citation">Citation</a>
+  <a href="#training">Training</a> |
+  <a href="https://forge.coreweave.com/wandb/diffusionRL-Curl/thesis">W&amp;B logs</a>
 </p>
 
-This repository contains the reference implementation for **FlowBP**, a
-surrogate-trajectory framework for direct reward backpropagation on
-text-to-image flow matching models.
+Reward alignment fine-tunes a pretrained image generator so that its images
+receive higher scores from a reward model. For a flow model such as
+Stable Diffusion 3.5 Medium (SD3.5-M), the full reward gradient has two costs:
+backpropagation runs through all 25 generation steps, and the update touches
+all 2.5 billion parameters. This repository implements two approximations of
+that full gradient, one for each cost:
 
-FlowBP keeps the normal sampling rollout under `no_grad`, caches the sampled
-trajectory, and then constructs a compact backward surrogate from cached and
-selectively re-forwarded velocities. The reward model scores the actual sampled
-image, while memory cost and gradient depth are controlled by the surrogate.
+- **FlowBP** approximates over the steps: it differentiates only a few
+  generation steps.
+- **GradLoRA** approximates over the parameters: it trains a rank-eight LoRA
+  adapter whose initial space is chosen from reward gradients.
 
-![FlowBP pipeline](assets/readme/flowbp_pipeline.png)
+The two can be used separately or together. All experiments fine-tune SD3.5-M
+on the HPSv3++ reward.
 
-## Highlights
+## FlowBP
 
-- **Unified design space.** FlowBP separates direct reward backpropagation into
-  four choices: reward-model input, active timesteps, integration weights, and
-  bridge coupling.
-- **Three new variants.** `FlowBP-Sparse`, `FlowBP-Bridge`, and
-  `FlowBP-Lagrange` instantiate different accuracy, memory, and coupling
-  trade-offs.
-- **Strong cross-backbone gains.** On `SD3.5-M`, `FLUX.1-dev`, and
-  `FLUX.2-Klein-base`, FlowBP variants improve over the base model on all five
-  HPDv2 metrics and lead most preference/quality scores.
-- **Baseline coverage.** The code also includes direct-gradient baselines:
-  `ReFL`, `DRaFT-LV`, `DRTune`, and `LeapAlign`.
+![FlowBP two passes](assets/readme/flowbp_two_pass.png)
 
-## Table of Contents
+FlowBP separates making the image from learning from it.
 
-- [Highlights](#highlights)
-- [Table of Contents](#table-of-contents)
-- [Method Overview](#method-overview)
-  - [FlowBP Variants](#flowbp-variants)
-- [Main Results](#main-results)
-  - [SD3.5-M](#sd35-m)
-  - [FLUX.1-dev 12B](#flux1-dev-12b)
-  - [FLUX.2-Klein-base 9B](#flux2-klein-base-9b)
-  - [GenEval on FLUX.1-dev](#geneval-on-flux1-dev)
-- [Ablation Takeaways](#ablation-takeaways)
-- [Supported Backbones](#supported-backbones)
-- [Installation](#installation)
-- [Quick Start](#quick-start)
-  - [1. Preprocess prompts](#1-preprocess-prompts)
-  - [2. Train a FlowBP model](#2-train-a-flowbp-model)
-  - [3. Choose a final config](#3-choose-a-final-config)
-- [Evaluation](#evaluation)
-- [Repository Layout](#repository-layout)
-- [Acknowledgements](#acknowledgements)
-- [Citation](#citation)
-- [License](#license)
+1. **Pass 1** runs all 25 steps without recording activations and saves each
+   step's state `x_i` and velocity `v_i`.
+2. **Pass 2** draws `K` active steps uniformly at random (three of 25 in the
+   thesis) and reruns only those network calls from their saved inputs with
+   recording on. The saved velocities of the other steps rebuild the same
+   image.
+3. The reward model scores this **complete image** `x_0`, not an estimate of
+   it. The gradient flows back only through the direct effects of the active
+   steps; the carry-through to later states is dropped.
 
-## Method Overview
+Because the reward model scores the image the sampler actually generates, the
+only remaining error comes from the restricted backward calculation.
 
-Directly differentiating a reward through a flow sampler is sample-efficient,
-but naive full-trajectory backpropagation is impractical for modern text-to-image
-models:
+In the code, FlowBP is the `flowbp_sparse` trainer
+(`flowbp/trainers/sd35/flowbp_sparse.py`). The settings are:
 
-- storing activations for every denoising step is too expensive;
-- chained Jacobian products across many steps can inflate gradients;
-- connector shortcuts such as LeapAlign avoid full backpropagation, but a long
-  single-velocity leap can create a large connector residual.
-
-FlowBP treats the backward trajectory itself as the design object. A cached
-forward rollout provides the sampled endpoint, and a smaller surrogate graph
-decides where the reward gradient is allowed to flow.
-
-| Design axis | What it controls |
-| --- | --- |
-| Reward-model input | Whether the reward sees the sampled image `x_0` or a posterior-mean estimate. |
-| Active set | Which timesteps are re-forwarded with gradients. |
-| Integration weights | Euler weights `h_i` or higher-order Lagrange quadrature weights. |
-| Bridge coupling | Whether a split latent keeps one nested cross-step gradient path, scaled by `alpha`. |
-
-This view recovers prior direct-gradient methods as specific surrogate choices:
-ReFL, DRaFT-LV, and DRTune use short or sparse detached reward targets;
-LeapAlign uses a two-hop connector path; FlowBP explores endpoint-faithful sparse
-reconstruction, controlled bridge coupling, and higher-order leap quadrature.
-
-### FlowBP Variants
-
-| Method              | Reward input        | Weights             | Active set               | Bridge          |
-| ---------------------| ---------------------| ---------------------| --------------------------| -----------------|
-| ReFL                | Posterior mean      | Single-step         | `{tau}`                  | No              |
-| DRaFT-LV            | Sampled image `x_0` | Last-step           | `{1}`                    | No              |
-| DRTune              | Posterior mean      | Euler + leap        | Sparse train steps       | No              |
-| LeapAlign           | Sampled image `x_0` | Two Euler leaps     | `{k, j}`                 | Yes             |
-| **FlowBP-Sparse**   | Sampled image `x_0` | Euler               | `K` indices              | No              |
-| **FlowBP-Bridge**   | Sampled image `x_0` | Euler               | `K` indices split at `j` | Tunable `alpha` |
-| **FlowBP-Lagrange** | Sampled image `x_0` | Lagrange quadrature | Compact support set      | Tunable `alpha` |
-
-## Main Results
-
-All results below are evaluated on the **HPDv2 test split** with 400 held-out
-prompts. Post-training uses HPSv2.1 as the differentiable reward, so HPSv2.1 is
-the in-domain metric; PickScore, ImageReward, UR-Align, and UR-IQ are
-out-of-domain evaluators. Higher is better for every metric.
-
-### SD3.5-M
-
-| Method | HPSv2.1 | PickScore | ImageReward | UR-Align | UR-IQ |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| SD3.5-M | 0.2881 | 22.5004 | 0.9504 | 3.3935 | 3.6376 |
-| ReFL | 0.3872 | 23.4021 | 1.3799 | 3.4779 | 3.9464 |
-| DRaFT-LV | 0.3818 | 23.3506 | 1.3673 | 3.5072 | 3.9245 |
-| DRTune | 0.3870 | 23.2882 | 1.3794 | 3.4562 | 3.8869 |
-| LeapAlign | 0.3924 | 23.3142 | 1.4425 | 3.4854 | 3.9030 |
-| **FlowBP-Sparse** | 0.3939 | 23.4104 | 1.4299 | 3.4774 | **3.9690** |
-| **FlowBP-Bridge** | 0.3966 | 23.4130 | 1.4386 | 3.4712 | 3.9481 |
-| **FlowBP-Lagrange** | **0.3998** | **23.5040** | **1.4538** | **3.5127** | 3.9680 |
-
-On `SD3.5-M`, FlowBP-Lagrange leads HPSv2.1, PickScore, ImageReward, and
-UR-Align, while FlowBP-Sparse gives the best UR-IQ.
-
-### FLUX.1-dev 12B
-
-| Method | HPSv2.1 | PickScore | ImageReward | UR-Align | UR-IQ |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| FLUX.1-dev | 0.3016 | 22.5940 | 1.0094 | 3.3168 | 3.7551 |
-| ReFL | 0.3930 | 23.6886 | 1.3916 | 3.5005 | 4.0293 |
-| DRaFT-LV | 0.3900 | 23.6290 | 1.3910 | 3.5264 | 4.0259 |
-| DRTune | 0.3920 | 23.6704 | 1.4273 | 3.5403 | 4.0697 |
-| LeapAlign | 0.4063 | 23.6158 | 1.4373 | 3.5290 | 4.0584 |
-| **FlowBP-Sparse** | 0.4081 | 23.7458 | 1.4742 | 3.5408 | 4.0897 |
-| **FlowBP-Bridge** | 0.4119 | **23.7952** | **1.5156** | 3.5681 | **4.1098** |
-| **FlowBP-Lagrange** | **0.4134** | 23.7796 | 1.4906 | **3.5848** | 4.0950 |
-
-On `FLUX.1-dev`, FlowBP-Lagrange is strongest on HPSv2.1 and UR-Align, while
-FlowBP-Bridge leads PickScore, ImageReward, and UR-IQ.
-
-### FLUX.2-Klein-base 9B
-
-| Method | HPSv2.1 | PickScore | ImageReward | UR-Align | UR-IQ |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| FLUX.2-Klein-base | 0.2873 | 22.3158 | 1.1405 | 3.6392 | 3.7982 |
-| ReFL | 0.4272 | 23.6002 | 1.6245 | 3.6817 | 4.0565 |
-| DRaFT-LV | 0.4233 | 23.6288 | 1.6262 | 3.6495 | 3.9319 |
-| DRTune | 0.4122 | 23.5716 | 1.6264 | 3.6638 | 4.0589 |
-| LeapAlign | 0.4246 | 23.4884 | 1.6553 | **3.6926** | 4.0625 |
-| **FlowBP-Sparse** | 0.4384 | **23.8446** | **1.6649** | 3.6720 | **4.0787** |
-| **FlowBP-Bridge** | **0.4387** | 23.7718 | 1.6491 | 3.6775 | 4.0720 |
-| **FlowBP-Lagrange** | 0.4321 | 23.6938 | 1.6376 | 3.6705 | 4.0652 |
-
-On `FLUX.2-Klein-base`, reconstruction-based FlowBP variants dominate most
-metrics: FlowBP-Bridge gives the best HPSv2.1, and FlowBP-Sparse gives the best
-PickScore, ImageReward, and UR-IQ. LeapAlign remains strongest on UR-Align.
-
-### GenEval on FLUX.1-dev
-
-GenEval measures compositional prompt following. Values below are task-level
-accuracies or the official overall score.
-
-| Method | Overall | Single Obj. | Two Obj. | Count | Color | Position | Attr. Binding |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| FLUX.1-dev | 63.25 | 97.81 | 76.52 | 70.31 | 76.86 | 17.75 | 40.25 |
-| ReFL | 65.94 | 97.50 | 77.27 | 71.88 | 78.99 | 22.25 | 47.75 |
-| DRaFT-LV | 68.31 | 98.13 | **86.36** | **75.00** | 77.13 | 23.25 | 50.00 |
-| DRTune | 66.78 | 98.75 | 80.56 | 72.81 | 76.33 | 20.75 | 51.50 |
-| LeapAlign | 67.44 | 98.44 | 84.09 | 72.19 | 78.19 | 22.25 | 49.50 |
-| **FlowBP-Sparse** | 68.19 | 98.75 | 84.85 | 73.13 | 78.19 | 22.00 | 52.25 |
-| **FlowBP-Bridge** | 68.75 | 96.88 | 85.10 | 70.94 | 76.86 | **27.25** | 55.50 |
-| **FlowBP-Lagrange** | **69.88** | **99.06** | 85.10 | 71.88 | **79.52** | 23.75 | **60.00** |
-
-FlowBP-Lagrange improves the GenEval overall score from **63.25** to **69.88**
-and gives the best single-object, color, and attribute-binding scores.
-FlowBP-Bridge gives the best spatial-position score.
-
-## Ablation Takeaways
-
-- **Endpoint-faithful reward input matters.** Replacing posterior-mean reward
-  targets with endpoint reconstruction improves ReFL/DRTune-style surrogates on
-  `FLUX.1-dev`.
-- **Higher-order connectors reduce mismatch.** FlowBP-Lagrange lowers connector
-  deviation over long leaps compared with single-velocity Euler connectors,
-  which helps avoid reward collapse when the surrogate endpoint drifts.
-- **Bridge coupling should be controlled.** FlowBP-Bridge benefits from an
-  intermediate nested-gradient scale: enough coupling to propagate signal across
-  the split, but not so much that the single-Jacobian path dominates.
-- **Active-step budgets are compact.** Increasing `K` improves trajectory
-  coverage but also grows the backward graph; the final configs use small active
-  sets to keep memory bounded.
-
-## Supported Backbones
-
-The implementation is organized by model family:
-
-```text
-flowbp/trainers/
-  common/      # shared sampling and high-order quadrature utilities
-  flux1/       # FLUX.1-dev trainers
-  flux2/       # FLUX.2-Klein-base trainers
-  sd35/        # SD3.5-M trainers
+```yaml
+trainer:
+  name: flowbp_sparse
+flowbp_sparse:
+  num_active_steps: 3   # K
+  late_bias: 0.0        # 0 = uniform draw over all steps
+  grad_rescale: 0.0     # raw step sizes, no rescaling
 ```
 
-Training entrypoints:
+The `flowbp_bridge` trainer adds a weighted connection between steps. The
+thesis uses it only in Section 6.2.3.
 
-```text
-flowbp/train_flowbp_flux.py     # FLUX.1
-flowbp/train_flowbp_flux2.py    # FLUX.2
-flowbp/train_flowbp_sd35.py     # SD3.5
+## GradLoRA
+
+![What the first LoRA update keeps](assets/readme/gradlora_lora_filter.png)
+
+Standard LoRA starts its input factor `A` from random rows, so the first
+update keeps only the part of the reward gradient that lies in a random
+rank-`r` space. GradLoRA picks that space from the reward gradient instead.
+For each adapted weight matrix it:
+
+1. **Measures** an approximate reward-gradient matrix at the pretrained
+   parameters from four FlowBP calibration batches;
+2. **Averages** them into the calibration mean `Ḡ`;
+3. **Selects** the leading `r` right singular vectors `V_r` of `Ḡ`;
+4. **Initialises** `A₀ = ρ₀ V_rᵀ` and `B₀ = 0`, with
+   `ρ₀ = ‖A_rand‖_F / √r`, so `A₀` has the same size as a standard random
+   start;
+5. **Trains** both factors as in standard LoRA.
+
+Only `A₀` changes. The rank, adapted layers, LoRA scale, number of trainable
+parameters, and the unchanged initial model (`B₀ = 0`) are the same as
+standard LoRA. Calibration costs four gradient batches, about 1.3% of the 300
+training batches, plus one randomised SVD per adapted matrix.
+
+The code is in `flowbp/utils/gradlora_adapter.py`. The settings are:
+
+```yaml
+gradlora:
+  enabled: true
+  target_modules: default   # attention and feed-forward projections
+  rank: 8
+  alpha: 16                 # LoRA scale s = alpha / rank = 2
+  calibration_batches: 4
+  calibration_mode: sparse  # calibrate with the FlowBP gradient
+  use_second_moment: false  # SVD of the calibration mean
 ```
 
-Final paper-style configs are under:
+## Results
 
-```text
-configs/final/flux1/
-configs/final/flux2/
-configs/final/sd35/
-```
+Final evaluation on SD3.5-M after 300 updates, averaged over five rounds of
+200 held-out DrawBench prompts. HPSv3++ is the training reward; HPSv2.1,
+PickScore, and ImageReward are auxiliary scores. Higher is better.
 
-Each family provides configs for FlowBP-Sparse, FlowBP-Bridge,
-FlowBP-Lagrange, and the baseline methods.
+**Approximation over the steps**, with all parameters trainable
+(thesis Table 6.3):
+
+| Method | HPSv3++ | HPSv2.1 | PickScore | ImageReward |
+| --- | ---: | ---: | ---: | ---: |
+| Pretrained SD3.5-M | 7.06 | 0.275 | 0.862 | 0.77 |
+| ReFL | 14.43 | 0.320 | 0.883 | 1.03 |
+| DRTune | 14.41 | 0.323 | 0.869 | 0.88 |
+| LeapAlign | 13.07 | 0.300 | 0.840 | 0.29 |
+| **FlowBP** (K = 3) | 14.99 | 0.325 | 0.883 | 1.13 |
+
+**Approximation over the parameters**, all with FlowBP K = 3 gradients
+(thesis Table 6.5):
+
+| Update rule | Trainable | HPSv3++ | HPSv2.1 | PickScore | ImageReward |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Dense fine-tuning | 2.5B | 14.99 | 0.325 | 0.883 | 1.13 |
+| LoRA, attention only | 6.0M | 13.83 | 0.313 | 0.879 | 0.99 |
+| LoRA, all layers | 11.7M | 14.02 | 0.315 | 0.879 | 1.02 |
+| **GradLoRA**, all layers | 11.7M | 14.60 | 0.320 | 0.882 | 1.04 |
+
+GradLoRA recovers about 95% of the dense FlowBP reward gain while training
+0.47% as many parameters. On held-out samples, the GradLoRA space captures
+8.8% of the full-gradient energy, about 90 times as much as random spaces of
+the same rank.
 
 ## Installation
 
-Reference environment used for the paper experiments:
-
-| Component | Version                              |
-| -----------| --------------------------------------|
-| Python    | 3.10                                 |
-| CUDA      | 12.4                                 |
-| PyTorch   | 2.6.0                                |
-| GPU       | NVIDIA H20 / H100 / H800 / A100-80GB |
-
-
-
-Clone the repository and run the setup script:
+The experiments used Python 3.10, CUDA 12.4, PyTorch 2.6.0, and one node with
+eight GPUs.
 
 ```bash
-git clone https://github.com/RuoyuWang-2077/FlowBP
-cd FlowBP
+git clone https://github.com/MuL1ian/FlowBP-2.git
+cd FlowBP-2
 bash setup.sh
 ```
 
-The script creates a `flowbp` conda environment with Python 3.10, installs the
-PyTorch stack before source-built extensions such as `flash-attn`, installs the
-pinned paper environment from `requirements.txt`, and installs this repository
-in editable mode without re-resolving dependencies from `pyproject.toml`.
+`setup.sh` creates a conda environment (set `ENV_ROOT` and `ENV_NAME` to
+choose where), installs PyTorch before `flash-attn`, installs the pinned
+environment from `requirements.txt`, and installs this repository in editable
+mode.
 
-Equivalent manual setup:
+## Data and checkpoints
 
-```bash
-git clone https://github.com/RuoyuWang-2077/FlowBP
-cd FlowBP
+Model weights, reward checkpoints, and prompt embeddings are not committed.
+The configs expect:
 
-conda create -n flowbp python=3.10 -y
-conda activate flowbp
+| What | Where |
+| --- | --- |
+| SD3.5-M weights | `checkpoints/SD3.5_medium` |
+| HPSv3++ reward | `checkpoints/reward_ckpts/HPSv3-PlusPlus/{config.json,hpsv3++.pth}` |
+| Auxiliary reward models | `checkpoints/reward_ckpts` |
+| Training prompts | `assets/prompts.txt` (about 104k prompts) |
+| Evaluation prompts | `drawbench/test.txt` (200 DrawBench prompts, five rounds) |
 
-python -m pip install --upgrade pip setuptools wheel packaging ninja
-python -m pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0
-python -m pip install flash_attn==2.7.4.post1 --no-build-isolation
-pip install -r requirements.txt
-pip install -e . --no-deps
-```
-
-Model checkpoints, reward checkpoints, and precomputed prompt embeddings are not
-committed to this repository. Update the paths in `configs/final/**` or override
-them from the command line.
-
-## Quick Start
-
-### 1. Preprocess prompts
-
-The training code expects precomputed prompt embeddings:
+Encode the training prompts once with the SD3.5 text encoders:
 
 ```bash
-bash scripts/preprocess/preprocess_flux1_embeddings.sh
-bash scripts/preprocess/preprocess_flux2_embeddings.sh
 bash scripts/preprocess/preprocess_sd35_embeddings.sh
+# writes data/sd3_5_rl_embeddings/videos2caption.json
 ```
 
-Common overrides:
+`MODEL_PATH`, `PROMPT_FILE`, and `OUTPUT_DIR` override the defaults.
+
+## Training
+
+Every experiment in Chapter 6 has a config in `configs/thesis/`:
 
 ```bash
-MODEL_PATH=/path/to/model \
-PROMPT_FILE=assets/prompts.txt \
-OUTPUT_DIR=data/rl_embeddings_flux2 \
-bash scripts/preprocess/preprocess_flux2_embeddings.sh
+# FlowBP, all parameters trainable
+CONFIG=configs/thesis/sd3_5_flowbp_sparse_hpsv3plusplus_k3.yaml \
+  bash scripts/finetune/train_sd35.sh
+
+# GradLoRA with FlowBP gradients
+CONFIG=configs/thesis/sd3_5_flowbp_sparse_hpsv3plusplus_k3_gradlora_mean_all_r8_lr1e4.yaml \
+  bash scripts/finetune/train_sd35.sh
 ```
 
-### 2. Train a FlowBP model
+Command-line flags after the script override the YAML, for example
+`--flowbp_sparse_num_active_steps 5`. The launcher reads `NNODES`,
+`NPROC_PER_NODE`, `MASTER_ADDR`, and `MASTER_PORT` for multi-node runs.
 
-Use the family-specific launch scripts:
+[`configs/thesis/README.md`](configs/thesis/README.md) maps each config and
+sweep to its thesis table and W&B run. The baselines ReFL, DRTune, and
+LeapAlign use the same entry point with `trainer.name` set to `refl`,
+`drtune`, or `leapalign`.
 
-```bash
-bash scripts/finetune/train_flux1.sh
-bash scripts/finetune/train_flux2.sh
-bash scripts/finetune/train_sd35.sh
-```
+## Training logs
 
-Each script defaults to the FlowBP-Lagrange final config for that backbone.
-Override `CONFIG` to run another method:
+Every thesis run, with its learning curves, evaluation scores, and sample
+images, is in the W&B project
+[diffusionRL-Curl/thesis](https://forge.coreweave.com/wandb/diffusionRL-Curl/thesis).
 
-```bash
-CONFIG=configs/final/flux1/flux1_flowbp_sparse.yaml \
-bash scripts/finetune/train_flux1.sh
-
-CONFIG=configs/final/flux2/flux2_klein_base_9b_flowbp_bridge.yaml \
-bash scripts/finetune/train_flux2.sh
-
-CONFIG=configs/final/sd35/sd3_5_leapalign.yaml \
-bash scripts/finetune/train_sd35.sh
-```
-
-
-
-### 3. Choose a final config
-
-| Backbone | FlowBP-Sparse | FlowBP-Bridge | FlowBP-Lagrange |
-| --- | --- | --- | --- |
-| FLUX.1-dev | `configs/final/flux1/flux1_flowbp_sparse.yaml` | `configs/final/flux1/flux1_flowbp_bridge.yaml` | `configs/final/flux1/flux1_flowbp_lagrange.yaml` |
-| FLUX.2-Klein-base | `configs/final/flux2/flux2_klein_base_9b_flowbp_sparse.yaml` | `configs/final/flux2/flux2_klein_base_9b_flowbp_bridge.yaml` | `configs/final/flux2/flux2_klein_base_9b_flowbp_lagrange.yaml` |
-| SD3.5-M | `configs/final/sd35/sd3_5_flowbp_sparse.yaml` | `configs/final/sd35/sd3_5_flowbp_bridge.yaml` | `configs/final/sd35/sd3_5_flowbp_lagrange.yaml` |
-
-Baseline configs are available in the same directories for `refl`, `draft_lv`,
-`drtune`, and `leapalign`.
-
-## Evaluation
-
-Online evaluation lives under `flowbp/eval/`. The main scoring interface is
-`MultiScorer`, with reward backends for:
-
-- HPSv2
-- CLIPScore
-- PickScore
-- ImageReward
-- GenEval scoring
-- UnifiedReward-style scoring
-
-Reward checkpoint lookup is configured through `reward_ckpt_path` in the YAML
-configs or the `FLOWBP_REWARD_CKPT_PATH` environment variable.
-
-Recommended local layout:
+## Repository layout
 
 ```text
-models/reward_ckpts/
-  open_clip_pytorch_model.bin          # HPSv2 OpenCLIP backbone
-  HPS_v2.1_compressed.pt               # HPSv2.1 reward checkpoint
-  HPSv3/
-    HPSv3_7B.yaml                      # optional HPSv3 inferencer config
-    HPSv3.safetensors                  # or HPS_v3.1_compressed.pt / HPSv3.pt
-  ImageReward/                         # ImageReward cache/checkpoints
-  mask2former_swin-s-p4-w7-224_*.pth  # optional GenEval detector checkpoint
-```
-
-The canonical final configs listed above use the portable default:
-
-```yaml
-eval:
-  reward_ckpt_path: models/reward_ckpts
-```
-
-You can override it without editing YAML:
-
-```bash
-export FLOWBP_REWARD_CKPT_PATH=/path/to/reward_ckpts
-```
-
-Unavailable optional scorers can be skipped by the evaluation runner. For
-offline clusters, make sure reward-model checkpoints and any detector/backbone
-weights are pre-downloaded and that config paths point to local directories.
-
-## Repository Layout
-
-```text
-configs/final/                  # final paper-style configs
-flowbp/config/flowbp.py         # YAML config loader and trainer-name aliases
-flowbp/train_flowbp_*.py        # training entrypoints
-flowbp/trainers/                # trainer implementations by backbone
-flowbp/data_preprocess/         # prompt embedding preprocessors
-flowbp/dataset/                 # dataset loaders for precomputed embeddings
-flowbp/eval/                    # generation and reward evaluation
-scripts/finetune/               # training launch scripts
-scripts/preprocess/             # preprocessing launch scripts
-assets/readme/                  # README figures
+configs/thesis/             training configs for the thesis experiments
+drawbench/test.txt          evaluation prompts
+assets/prompts.txt          training prompts
+scripts/preprocess/         prompt-embedding preprocessing
+scripts/finetune/           torchrun launcher
+flowbp/train_flowbp_sd35.py training entry point
+flowbp/config/              YAML and command-line parsing
+flowbp/trainers/sd35/       FlowBP, FlowBP-Bridge, and the baselines
+flowbp/utils/gradlora_adapter.py   GradLoRA calibration and initialisation
+flowbp/utils/rq3_probe.py   held-out capture probe (Section 6.4)
+flowbp/rewards/             differentiable training reward (HPSv3++)
+flowbp/eval/                online evaluation and auxiliary scores
 ```
 
 ## Acknowledgements
 
-FlowBP builds on the broader line of direct reward-backpropagation methods for
-flow-matching alignment. We thank the [LeapAlign project](https://github.com/RockeyCoss/LeapAlign_Code)
-for its open-source implementation.
+FlowBP was developed in collaborative work with Ruoyu Wang, Xiangxin Zhou,
+Yushi Huang, Tongliang Liu, and Chi Zhang. The two-pass implementation builds
+on the open-source [LeapAlign](https://github.com/RockeyCoss/LeapAlign_Code)
+code.
 
 ## Citation
 
-If you use this code, please cite:
-
 ```bibtex
-@misc{wang2026exploringdesignspacereward,
-  title = {Exploring the Design Space of Reward Backpropagation for Flow Matching},
-  author = {Ruoyu Wang and Boye Niu and Xiangxin Zhou and Yushi Huang and Tongliang Liu and Chi Zhang},
-  year = {2026},
-  eprint = {2606.11075},
-  archivePrefix = {arXiv},
-  primaryClass = {cs.LG},
-  url = {https://arxiv.org/abs/2606.11075}
+@thesis{niu2026gradient,
+  title  = {Gradient Approximation for Reward Alignment in Generative Flow Models},
+  author = {Niu, Boye},
+  school = {The University of Sydney},
+  type   = {Honours thesis},
+  year   = {2026}
+}
+
+@article{wang2026flowbp,
+  title   = {Exploring the Design Space of Reward Backpropagation for Flow Matching},
+  author  = {Wang, Ruoyu and Niu, Boye and Zhou, Xiangxin and Huang, Yushi and Liu, Tongliang and Zhang, Chi},
+  journal = {arXiv preprint arXiv:2606.11075},
+  year    = {2026}
 }
 ```
 
 ## License
 
-This repository is released under the Apache-2.0 license. See `LICENSE` for
-details.
+Apache-2.0. See `LICENSE`.

@@ -5,7 +5,7 @@ from typing import Any
 import numpy as np
 import wandb
 
-from flowbp.eval.generation.flux import GeneratedEvalItem
+from flowbp.eval.generation.sd35 import GeneratedEvalItem
 
 
 def build_wandb_eval_log(

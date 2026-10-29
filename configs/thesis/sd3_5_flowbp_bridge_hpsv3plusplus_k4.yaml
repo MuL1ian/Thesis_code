@@ -1,0 +1,110 @@
+trainer:
+  name: flowbp_bridge
+
+model:
+  pretrained_model_name_or_path: checkpoints/SD3.5_medium
+  gradient_checkpointing: true
+  master_weight_type: bf16
+  use_ema: true
+  ema_decay: 0.995
+
+data:
+  data_json_path: data/sd3_5_rl_embeddings/videos2caption.json
+  num_latent_t: 1
+  cfg: 0.0
+  dataloader_num_workers: 4
+
+train:
+  seed: 42
+  # 8 GPUs x bs4 x ga1 => global batch 32, which every method in this thesis
+  # sweep matches.
+  train_batch_size: 4
+  train_sp_batch_size: 4
+  gradient_accumulation_steps: 1
+  max_train_steps: 300
+  # Equal to max_train_steps: only the final checkpoint is written, the
+  # 100/200 intermediates were never used.
+  checkpointing_steps: 300
+  output_dir: outputs/Thesis/sd3_5_flowbp_bridge_hpsv3plusplus_k4
+  allow_tf32: true
+
+optimizer:
+  learning_rate: 1.0e-5
+  weight_decay: 0.0001
+  lr_warmup_steps: 0
+  max_grad_norm: 1.0
+
+distributed:
+  sp_size: 1
+  fsdp_sharding_startegy: full
+
+sampling:
+  h: 512
+  w: 512
+  rollout_steps: 25
+  sampling_steps: 25
+  sampler_seed: 1223627
+  cfg_guidance: 4.0
+
+reward:
+  model_type: hpsv3plusplus
+  loss_type: neg_reward
+  loss_relu_clip: 0.55
+  loss_grad_scale: 1.0
+  hpsv3plusplus_iter_start: 0.3
+  hpsv3plusplus_iter_end: 1.0
+
+flowbp:
+  select_idx_seed: 114
+  # max_idx is exclusive. alpha couples the j-split.
+  min_idx: 1
+  max_idx: 26
+  jk_sampling_mode: uniform
+  alpha: 0.3
+
+# Bridge reads the same active-step knobs as Sparse (flowbp_sparse_* args) and
+# splits num_active_steps across the pre-j and post-j segments.
+flowbp_sparse:
+  num_active_steps: 4
+  # 0 = uniform within each bridge segment. Omit this key and the trainer
+  # default is late_bias=2.0.
+  late_bias: 0.0
+  # 0 = raw per-step Δσ, no magnitude compensation toward full Euler.
+  grad_rescale: 0.0
+
+# NOTE: this section name is a historical wart in flowbp/config/flowbp.py -- the
+# `flux2` key map is model-agnostic and is the only place these two CFG flags are
+# read from. Every config in this sweep sets both explicitly so no method silently
+# picks up a different CFG gradient than the others.
+flux2:
+  cfg_detach_neg: true
+  cfg_grad_norm_compensate: false
+
+eval:
+  evaluation_interval: 100
+  prompts_file: drawbench/test.txt
+  num_imgs_per_prompt: 1
+  seed: 42
+  num_steps: 25
+  guidance_scale: 4.0
+  reward_ckpt_path: checkpoints/reward_ckpts
+  hpsv3_config_path: checkpoints/reward_ckpts/HPSv3-PlusPlus/config.json
+  hpsv3_checkpoint_path: checkpoints/reward_ckpts/HPSv3-PlusPlus/hpsv3++.pth
+  # Training already hosts a differentiable HPSv3++; online eval reuses it and
+  # does not load a second copy. Keep other non-differentiable metrics here.
+  reward_fn:
+    clipscore: 1.0
+    hpsv2: 1.0
+    pickscore: 1.0
+    imagereward: 1.0
+    hpsv3plusplus: 1.0
+
+logging:
+  project: thesis
+  run_name: sd3_5_flowbp_bridge_hpsv3plusplus_k4_bs4
+  tags:
+    - thesis
+    - hpsv3plusplus
+    - sd35
+    - flowbp-bridge
+    - k4

@@ -211,9 +211,8 @@ data/
 hps_ckpt/
 output/
 
-# Generated evaluation outputs
-geneval_final/
-**/geneval_final/
+# Model and reward checkpoints
+checkpoints/
 
 # Local test helper scripts
 scripts/test/

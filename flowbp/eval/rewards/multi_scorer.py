@@ -10,8 +10,7 @@ For FlowBP evaluation, we use a simplified interface:
     # score_details = {"pickscore": [...], "hpsv2": [...], "mean": [...]}
 
 Supported reward keys include:
-pickscore, hpsv2, mps, hpsv3, hpsv3plusplus, clipscore, imagereward, geneval,
-unifiedreward, ur-align, ur-iq.
+pickscore, hpsv2, hpsv3, hpsv3plusplus, clipscore, imagereward.
 """
 
 import logging
@@ -20,7 +19,6 @@ from contextlib import contextmanager
 import numpy as np
 import torch
 from PIL import Image
-from collections import defaultdict
 
 
 @contextmanager
@@ -129,17 +127,6 @@ def hpsv2_score(device):
     return _fn
 
 
-def mps_score(device):
-    from flowbp.eval.rewards.mps_scorer import MPSScorer
-    scorer = MPSScorer(dtype=torch.float32, device=device)
-    def _fn(images, prompts, metadata):
-        del metadata
-        images = _pil_list_to_nchw_tensor(images).float() / 255.0
-        scores = scorer(images, prompts)
-        return scores, {}
-    return _fn
-
-
 def hpsv3_score(device):
     from flowbp.eval.rewards.hpsv3_scorer import HPSv3Scorer
     scorer = HPSv3Scorer(dtype=torch.float32, device=device)
@@ -184,180 +171,6 @@ def imagereward_score(device):
     return _fn
 
 
-class GenevalScorerAdapter(torch.nn.Module):
-    """Device-aware adapter for GenEval function backend.
-
-    MultiScorer initializes single-reward scorers on CPU during warmup; that behavior
-    makes closure-based Geneval backends stick to CPU because `.to()` cannot migrate
-    non-module closures. This adapter exposes `.to()` and lazily reloads the Geneval
-    backend on the target device.
-    """
-
-    def __init__(self, device, batch_size: int = 64):
-        super().__init__()
-        self.batch_size = int(batch_size)
-        self._requested_device = torch.device(device)
-        self._runtime_device = self._resolve_initial_device(self._requested_device)
-        self._force_cpu = self._runtime_device.type == "cpu"
-        self._compute_geneval = None
-        self._load_backend(self._runtime_device)
-
-    @staticmethod
-    def _resolve_initial_device(device: torch.device) -> torch.device:
-        # CPU init is often just a temporary warmup state before scorer.to(cuda).
-        if device.type == "cpu" and torch.cuda.is_available():
-            return torch.device("cuda", torch.cuda.current_device())
-        return device
-
-    def _load_backend(self, device: torch.device) -> None:
-        from flowbp.eval.rewards.geneval_scorer import load_geneval
-
-        self._runtime_device = device
-        self._compute_geneval = load_geneval(device)
-
-    def _parse_to_device(self, args, kwargs) -> torch.device | None:
-        target = kwargs.get("device")
-        if target is None and args:
-            first = args[0]
-            if isinstance(first, (str, int, torch.device)):
-                target = first
-        if target is None:
-            return None
-        if isinstance(target, int):
-            return torch.device("cuda", target)
-        return torch.device(target)
-
-    def _ensure_backend_loaded(self) -> None:
-        if self._compute_geneval is not None:
-            return
-        load_device = self._runtime_device
-        if (
-            load_device.type == "cpu"
-            and torch.cuda.is_available()
-            and not self._force_cpu
-        ):
-            load_device = torch.device("cuda", torch.cuda.current_device())
-        self._load_backend(load_device)
-
-    def to(self, *args, **kwargs):
-        super().to(*args, **kwargs)
-        target_device = self._parse_to_device(args, kwargs)
-        if target_device is None:
-            return self
-
-        if target_device.type == "cuda":
-            if target_device.index is None:
-                target_device = torch.device("cuda", torch.cuda.current_device())
-            self._force_cpu = False
-            if self._compute_geneval is None or self._runtime_device != target_device:
-                self._load_backend(target_device)
-            return self
-
-        if target_device.type == "cpu":
-            # Offload by dropping heavy backend references. Reload lazily on next use.
-            self._force_cpu = True
-            self._runtime_device = target_device
-            self._compute_geneval = None
-            return self
-
-        # Fallback for uncommon device types.
-        self._force_cpu = target_device.type == "cpu"
-        if self._compute_geneval is None or self._runtime_device != target_device:
-            self._load_backend(target_device)
-        return self
-
-    def __call__(self, images, prompts, metadatas, only_strict):
-        del prompts
-        self._ensure_backend_loaded()
-        if isinstance(images, torch.Tensor):
-            images = (images * 255).round().clamp(0, 255).to(torch.uint8).cpu().numpy()
-            images = images.transpose(0, 2, 3, 1)
-        elif isinstance(images, list) and len(images) > 0 and isinstance(images[0], Image.Image):
-            images = np.stack([np.array(img) for img in images], axis=0)
-        if metadatas is None or not isinstance(metadatas, list) or len(metadatas) == 0:
-            raise ValueError(
-                "geneval scorer requires non-empty metadata list aligned with images. "
-                "Please evaluate geneval on dataset metadata jsonl (e.g., test_metadata.jsonl)."
-            )
-        if len(images) != len(metadatas):
-            raise ValueError(
-                f"geneval scorer image/metadata size mismatch: "
-                f"num_images={len(images)}, num_metadatas={len(metadatas)}"
-            )
-        num_sections = max(1, int(np.ceil(len(images) / self.batch_size)))
-        images_batched = np.array_split(images, num_sections)
-        metadatas_batched = np.array_split(np.array(metadatas, dtype=object), num_sections)
-        all_scores = []
-        all_rewards = []
-        all_strict_rewards = []
-        all_group_strict_rewards = []
-        all_group_rewards = []
-        for image_batch, metadata_batched in zip(images_batched, metadatas_batched):
-            pil_images = [Image.fromarray(image) for image in image_batch]
-            data = {
-                "images": pil_images,
-                "metadatas": list(metadata_batched),
-                "only_strict": only_strict,
-            }
-            scores, rewards, strict_rewards, group_rewards, group_strict_rewards = (
-                self._compute_geneval(**data)
-            )
-            all_scores += scores
-            all_rewards += rewards
-            all_strict_rewards += strict_rewards
-            all_group_strict_rewards.append(group_strict_rewards)
-            all_group_rewards.append(group_rewards)
-        all_group_strict_rewards_dict = defaultdict(list)
-        all_group_rewards_dict = defaultdict(list)
-        for current_dict in all_group_strict_rewards:
-            for key, value in current_dict.items():
-                all_group_strict_rewards_dict[key].extend(value)
-        all_group_strict_rewards_dict = dict(all_group_strict_rewards_dict)
-        for current_dict in all_group_rewards:
-            for key, value in current_dict.items():
-                all_group_rewards_dict[key].extend(value)
-        all_group_rewards_dict = dict(all_group_rewards_dict)
-        return all_scores, all_rewards, all_strict_rewards, all_group_rewards_dict, all_group_strict_rewards_dict
-
-
-def geneval_score(device):
-    return GenevalScorerAdapter(device=device, batch_size=64)
-
-
-def unifiedreward_score(device):
-    from flowbp.eval.rewards.unifiedreward_scorer import UnifiedRewardScorer
-    scorer = UnifiedRewardScorer(dtype=torch.float32, device=device)
-    def _fn(images, prompts, metadata):
-        del metadata
-        images = _pil_list_to_pil(images)
-        scores = scorer(images, prompts)
-        return scores, {}
-    return _fn
-
-
-def unifiedreward_align_score(device):
-    from flowbp.eval.rewards.unifiedreward_scorer import UnifiedRewardScorer
-    scorer = UnifiedRewardScorer(dtype=torch.float32, device=device, criterion="align")
-    def _fn(images, prompts, metadata):
-        del metadata
-        images = _pil_list_to_pil(images)
-        scores = scorer(images, prompts)
-        return scores, {}
-    return _fn
-
-
-def unifiedreward_iq_score(device):
-    from flowbp.eval.rewards.unifiedreward_scorer import UnifiedRewardScorer
-    scorer = UnifiedRewardScorer(dtype=torch.float32, device=device, criterion="iq")
-    def _fn(images, prompts, metadata):
-        del metadata
-        images = _pil_list_to_pil(images)
-        scores = scorer(images, prompts)
-        return scores, {}
-    return _fn
-
-
-
 class MultiScorer:
     """Wrapper that computes weighted multi-reward scores and supports device offloading."""
 
@@ -365,13 +178,8 @@ class MultiScorer:
         score_functions = {
             "imagereward": imagereward_score,
             "pickscore": pickscore_score,
-            "geneval": geneval_score,
-            "unifiedreward": unifiedreward_score,
-            "ur-align": unifiedreward_align_score,
-            "ur-iq": unifiedreward_iq_score,
             "clipscore": clip_score,
             "hpsv2": hpsv2_score,
-            "mps": mps_score,
             "hpsv3": hpsv3_score,
             "hpsv3plusplus": hpsv3plusplus_score,
         }
@@ -428,25 +236,14 @@ class MultiScorer:
         self.active_reward_names = list(self.score_dict.keys())
         self.unavailable_rewards = dict(self._unavailable)
 
-    def __call__(self, images, prompts, metadata=None, only_strict=True):
+    def __call__(self, images, prompts, metadata=None):
         if metadata is None:
             metadata = {}
         total_scores = []
         score_details = {}
 
         for score_name, weight in self.score_dict.items():
-            if score_name == "geneval":
-                scores, rewards, strict_rewards, group_rewards, group_strict_rewards = self.score_fns[score_name](
-                    images, prompts, metadata, only_strict
-                )
-                score_details["accuracy"] = rewards
-                score_details["strict_accuracy"] = strict_rewards
-                for key, value in group_strict_rewards.items():
-                    score_details[f"{key}_strict_accuracy"] = value
-                for key, value in group_rewards.items():
-                    score_details[f"{key}_accuracy"] = value
-            else:
-                scores, rewards = self.score_fns[score_name](images, prompts, metadata)
+            scores, rewards = self.score_fns[score_name](images, prompts, metadata)
             score_details[score_name] = scores
             weighted_scores = [weight * score for score in scores]
 

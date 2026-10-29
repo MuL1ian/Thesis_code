@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 
 
-SUPPORTED_REWARD_MODELS = ("hpsv2", "mps", "hpsv3plusplus")
+SUPPORTED_REWARD_MODELS = ("hpsv2", "hpsv3plusplus")
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -154,28 +154,13 @@ def init_hpsv2_reward(args, device):
 def init_differentiable_reward(args, device):
     """Build the training reward for ``args.reward_model_type``.
 
-    Returns ``(reward_model, processor, preprocess_val)``. MPS and HPSv3++ carry
-    their own preprocessing, so both trailing values are ``None`` for them.
+    Returns ``(reward_model, processor, preprocess_val)``. HPSv3++ carries its
+    own preprocessing, so both trailing values are ``None`` for it.
     """
     selected = reward_model_type(args)
     if selected == "hpsv2":
         return init_hpsv2_reward(args, device)
-    if selected == "hpsv3plusplus":
-        return init_hpsv3plusplus_reward(args, device)
-    return init_mps_reward(args, device)
-
-
-def init_mps_reward(args, device):
-    from flowbp.rewards.mps_reward import MPSDifferentiableReward
-
-    model = MPSDifferentiableReward(
-        device=torch.device("cuda", device) if isinstance(device, int) else device,
-        checkpoint_path=getattr(args, "reward_ckpt_path", None),
-        processor_name=getattr(args, "mps_processor_name", None),
-        condition_text=getattr(args, "mps_condition", None),
-        mask_threshold=float(getattr(args, "mps_mask_threshold", 0.3)),
-    )
-    return model, None, None
+    return init_hpsv3plusplus_reward(args, device)
 
 
 def init_hpsv3plusplus_reward(args, device):
@@ -249,9 +234,6 @@ def compute_differentiable_reward(
 
     model_type = reward_model_type(args)
     prompt_list = normalize_prompts(prompts, images.shape[0])
-    if model_type == "mps":
-        return reward_model(images, prompt_list)
-
     if model_type == "hpsv3plusplus":
         images_for_reward = _as_chw_reward_tensors(images)
         iter_step = resolve_hpsv3plusplus_iter_step(

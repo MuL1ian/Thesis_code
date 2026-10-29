@@ -1,0 +1,124 @@
+trainer:
+  name: drtune
+
+model:
+  pretrained_model_name_or_path: checkpoints/SD3.5_medium
+  gradient_checkpointing: true
+  master_weight_type: bf16
+  use_ema: true
+  ema_decay: 0.995
+
+data:
+  data_json_path: data/sd3_5_rl_embeddings/videos2caption.json
+  num_latent_t: 1
+  cfg: 0.0
+  dataloader_num_workers: 4
+
+train:
+  seed: 42
+  # 8 GPUs x bs4 x ga1 => global batch 32, which every method in this thesis
+  # sweep matches.
+  train_batch_size: 4
+  train_sp_batch_size: 4
+  gradient_accumulation_steps: 1
+  max_train_steps: 300
+  # Equal to max_train_steps: only the final checkpoint is written, the
+  # 100/200 intermediates were never used.
+  checkpointing_steps: 300
+  output_dir: outputs/Thesis/sd3_5_drtune_hpsv3plusplus_endpoint_nostop
+  allow_tf32: true
+
+optimizer:
+  learning_rate: 1.0e-5
+  weight_decay: 0.0001
+  lr_warmup_steps: 0
+  max_grad_norm: 1.0
+
+distributed:
+  sp_size: 1
+  fsdp_sharding_startegy: full
+
+sampling:
+  h: 512
+  w: 512
+  rollout_steps: 25
+  sampling_steps: 25
+  sampler_seed: 1223627
+  cfg_guidance: 4.0
+
+reward:
+  model_type: hpsv3plusplus
+  loss_type: neg_reward
+  loss_relu_clip: 0.55
+  loss_grad_scale: 1.0
+  hpsv3plusplus_iter_start: 0.3
+  hpsv3plusplus_iter_end: 1.0
+  input_mode: sampled_x0
+
+flowbp:
+  # Seeds the per-step index sampler; DRTune draws its train-step subset and
+  # early-stop index from it.
+  select_idx_seed: 114
+
+drtune:
+  # 3 trained steps, matching the K=3 of the FlowBP-Sparse arm this is compared
+  # against.
+  num_train_steps: 3
+  # The only line that differs from sd3_5_drtune_hpsv3plusplus_endpoint.yaml,
+  # which leaves early_stop_ratio at 0.4. `_sample_drtune_early_stop_idx` reads
+  # early_stop_steps first and ignores the ratio when it is set, so 1 pins
+  # early_stop_idx at 24 instead of drawing it from [15, 24]. The 3 active steps
+  # are then spread equally over the whole trajectory rather than over a prefix.
+  #
+  # Why this is the run that isolates active-step placement. Both trainers give
+  # each active velocity the same coefficient |dsigma_i|, and dsigma grows
+  # sharply toward the clean end: indices 22-24 carry 21.6% of the total at
+  # shift=3 with 25 steps. Under the default ratio DRTune reaches index >=22 on
+  # 8% of steps against Sparse's 33%, and its expected total coefficient is
+  # 0.143 against Sparse's 0.120 -- larger, because the early-stop step enters
+  # through -sigma_j rather than dsigma_j. Pinning early_stop_idx at 24 removes
+  # both discrepancies at once: 0.119 against 0.120, and 33.3% against 33.0%.
+  #
+  # Falsifier: this leaves only the sampling law (equally-spaced-with-offset
+  # against uniform-without-replacement) between the two arms. If the 0.5224
+  # gap survives, active-step placement is not the responsible axis and S5b is
+  # not worth running.
+  early_stop_steps: 1
+
+# NOTE: this section name is a historical wart in flowbp/config/flowbp.py -- the
+# `flux2` key map is model-agnostic and is the only place these two CFG flags are
+# read from. Every config in this sweep sets both explicitly so no method silently
+# picks up a different CFG gradient than the others.
+flux2:
+  cfg_detach_neg: true
+  cfg_grad_norm_compensate: false
+
+eval:
+  evaluation_interval: 50
+  prompts_file: drawbench/test.txt
+  num_imgs_per_prompt: 1
+  seed: 42
+  num_steps: 25
+  guidance_scale: 4.0
+  reward_ckpt_path: checkpoints/reward_ckpts
+  hpsv3_config_path: checkpoints/reward_ckpts/HPSv3-PlusPlus/config.json
+  hpsv3_checkpoint_path: checkpoints/reward_ckpts/HPSv3-PlusPlus/hpsv3++.pth
+  # Training already hosts a differentiable HPSv3++; online eval reuses it and
+  # does not load a second copy. Keep other non-differentiable metrics here.
+  reward_fn:
+    clipscore: 1.0
+    hpsv2: 1.0
+    pickscore: 1.0
+    imagereward: 1.0
+    hpsv3plusplus: 1.0
+
+logging:
+  project: thesis
+  run_name: sd3_5_drtune_hpsv3plusplus_endpoint_nostop_bs4
+  tags:
+    - thesis
+    - hpsv3plusplus
+    - sd35
+    - drtune
+    - endpoint-reconstruction
+    - no-early-stop

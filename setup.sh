@@ -4,7 +4,7 @@ set -euo pipefail
 
 ENV_NAME="${ENV_NAME:-flowbp}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.10}"
-ENV_ROOT="${ENV_ROOT:-/apdcephfs_fsgm3/share_305110755/hunyuan/boye/envs}"
+ENV_ROOT="${ENV_ROOT:-$HOME/envs}"
 ENV_PATH="$ENV_ROOT/$ENV_NAME"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 

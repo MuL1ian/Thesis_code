@@ -1,17 +1,11 @@
-"""One argument parser shared by every FlowBP entrypoint.
+"""Argument parser for the FlowBP SD3.5 entrypoint.
 
-FLUX.1, FLUX.2 and SD3.5 used to each carry their own copy of the CLI surface.
-The FLUX.1 parser was the superset and SD3.5 imported it directly, while the
-FLUX.2 copy had drifted: it was missing the adapter (LoRA / GradLoRA / LoRA-GA /
-OFT / LoRA-Pro) flags and carried 26 arguments at different defaults.
-
-This module defines the union of all arguments once. Per-backbone defaults come
-from :mod:`flowbp.config.defaults`, applied on top via ``set_defaults`` so the
-resolved value for any existing config is unchanged.
+Every training option is defined here once. Backend defaults come from
+:mod:`flowbp.config.defaults`, applied on top via ``set_defaults``.
 
 Precedence, lowest to highest:
 
-1. the ``default=`` on each argument (the FLUX.1 / SD3.5 value)
+1. the ``default=`` on each argument
 2. ``BACKEND_DEFAULTS[backend]``
 3. the YAML file named by ``--config``
 4. explicit command-line flags
@@ -631,7 +625,7 @@ def build_parser(backend: str) -> argparse.ArgumentParser:
     parser.add_argument(
         "--reward_model_type",
         type=str,
-        choices=("hpsv2", "mps", "hpsv3plusplus"),
+        choices=("hpsv2", "hpsv3plusplus"),
         default="hpsv2",
         help="Differentiable reward used for generator back-propagation.",
     )
@@ -642,14 +636,6 @@ def build_parser(backend: str) -> argparse.ArgumentParser:
         help="Reward checkpoint file or root directory.",
     )
     parser.add_argument(
-        "--mps_processor_name",
-        type=str,
-        default=None,
-        help="Optional local path or Hugging Face id for the MPS CLIP processor.",
-    )
-    parser.add_argument("--mps_condition", type=str, default=None)
-    parser.add_argument("--mps_mask_threshold", type=float, default=0.3)
-    parser.add_argument(
         "--use_ema",
         action="store_true",
         help="Enable Exponential Moving Average of model weights.",
@@ -657,13 +643,13 @@ def build_parser(backend: str) -> argparse.ArgumentParser:
     parser.add_argument(
         "--project",
         type=str,
-        default="flux_rlhf",
+        default="flowbp",
         help="project name for wandb",
     )
     parser.add_argument(
         "--run_name",
         type=str,
-        default="flux_grpo",
+        default="flowbp_sd35",
         help="run name for wandb",
     )
     parser.add_argument(
@@ -671,7 +657,7 @@ def build_parser(backend: str) -> argparse.ArgumentParser:
         type=str,
         nargs="*",
         default=None,
-        help="Optional wandb tags, e.g. --wandb_tags mps lora.",
+        help="Optional wandb tags, e.g. --wandb_tags gradlora rank-8.",
     )
     parser.add_argument(
         "--cfg_guidance",
@@ -1013,15 +999,7 @@ def build_parser(backend: str) -> argparse.ArgumentParser:
             "when present."
         ),
     )
-    # ---- FLUX.2-only arguments -------------------------------------------
-    # Ignored by the FLUX.1 / SD3.5 trainers, which never read them.
-
-    parser.add_argument(
-        "--caption_key",
-        type=str,
-        default="caption",
-        help="JSON key that holds the prompt string in each dataset entry.",
-    )
+    # ---- CFG gradient and evaluation sampling ----------------------------
 
     parser.add_argument(
         "--cfg_detach_neg",
@@ -1054,45 +1032,10 @@ def build_parser(backend: str) -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
-        "--clip_d0",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "Switch: when on, drop samples whose one-step pred_x0 error d_0 "
-            "exceeds --clip_d0_threshold from the reward loss (their "
-            "gradient contribution is zeroed). Forward still runs for those "
-            "samples; only the reward signal is masked. ANDs with the "
-            "--clip_dj_threshold mask if both are active. Default: off."
-        ),
-    )
-
-    parser.add_argument(
-        "--clip_d0_threshold",
-        type=float,
-        default=0.2,
-        help=(
-            "Per-sample d_0 threshold used when --clip_d0 is enabled. "
-            "Default: 0.2."
-        ),
-    )
-
-    parser.add_argument(
-        "--clip_dj_threshold",
-        type=float,
-        default=0.0,
-        help=(
-            "If > 0, drop samples whose connector d_j exceeds the threshold "
-            "from the reward loss (their gradient contribution is zeroed). "
-            "Forward still runs for those samples; only the reward signal is "
-            "masked. Set 0 to disable (default)."
-        ),
-    )
-
-    parser.add_argument(
         "--eval_guidance_scale",
         type=float,
         default=4.0,
-        help="CFG scale for eval sampling (klein-base-4B default is 4.0).",
+        help="CFG scale for eval sampling.",
     )
 
     parser.add_argument(
@@ -1106,28 +1049,10 @@ def build_parser(backend: str) -> argparse.ArgumentParser:
         "--max_sequence_length",
         type=int,
         default=512,
-        help="Max Qwen3 tokenizer context (FLUX.2 default is 512).",
+        help="Max text-encoder sequence length for prompt encoding.",
     )
 
-    parser.add_argument(
-        "--text_encoder_out_layers",
-        type=int,
-        nargs="+",
-        default=[9, 18, 27],
-        help="Qwen3 hidden-state layer indices fused into prompt_embeds (3 layers -> 3*hidden_dim=7680).",
-    )
 
-    parser.add_argument(
-        "--use_precomputed_embeds",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "If set, load Qwen3 prompt embeddings precomputed by "
-            "flowbp/data_preprocess/preprocess_flux2_embedding.py instead of "
-            "running the text encoder on the fly. data_json_path should point "
-            "to the resulting captions2embed.json."
-        ),
-    )
 
     # ---- legacy spellings -------------------------------------------------
     for alias, canonical in ARG_ALIASES.items():
@@ -1158,14 +1083,6 @@ def _enabled_adapter_flags(args: argparse.Namespace) -> list[str]:
 
 def _validate_backend_args(backend: str, args: argparse.Namespace) -> None:
     enabled_adapters = _enabled_adapter_flags(args)
-    if backend in {"flux1", "flux2"} and enabled_adapters:
-        raise ValueError(
-            f"{backend} does not implement adapter training, but the following "
-            f"flags are enabled: {enabled_adapters}. Use the SD3.5 entrypoint "
-            "or disable these flags; otherwise the run would silently perform "
-            "full-parameter fine-tuning."
-        )
-
     if backend == "sd35" and enabled_adapters:
         resume = getattr(args, "resume_from_checkpoint", None)
         if resume:

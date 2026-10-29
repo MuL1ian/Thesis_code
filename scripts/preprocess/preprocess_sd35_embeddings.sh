@@ -8,7 +8,7 @@ export PYTHONPATH="$REPO_ROOT:${PYTHONPATH:-}"
 
 GPU_NUM="${GPU_NUM:-${HOST_GPU_NUM:-8}}"
 MASTER_PORT="${MASTER_PORT:-19104}"
-MODEL_PATH="${MODEL_PATH:-/apdcephfs_fsgm3/share_305110755/hunyuan/boye/datasets/SD3.5_medium}"
+MODEL_PATH="${MODEL_PATH:-checkpoints/SD3.5_medium}"
 PROMPT_FILE="${PROMPT_FILE:-assets/prompts.txt}"
 OUTPUT_DIR="${OUTPUT_DIR:-data/sd3_5_rl_embeddings}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
